@@ -1,6 +1,6 @@
 Package.describe({
   name: 'modern-browsers',
-  version: '0.1.7',
+  version: '0.2.4',
   summary:
     'API for defining the boundary between modern and legacy ' +
     'JavaScript clients',
@@ -10,6 +10,8 @@ Package.describe({
 Package.onUse(function(api) {
   api.use('modules');
   api.mainModule('modern.js', 'server');
+  api.addAssets('modern.d.ts', 'server');
+  api.types('modern.native.d.ts');
 });
 
 Package.onTest(function(api) {

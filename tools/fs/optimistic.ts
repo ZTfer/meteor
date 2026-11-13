@@ -3,7 +3,7 @@ import { wrap, OptimisticWrapperFunction, dep } from "optimism";
 import ignore from "ignore";
 import { Profile } from "../tool-env/profile";
 import { watch, SafeWatcher } from "./safe-watcher";
-import { sha1 } from "./watch";
+import { sha1, readFile as readFileOrNull } from "./watch";
 import {
   pathSep,
   pathBasename,
@@ -265,7 +265,7 @@ export const optimisticLStatOrNull = makeCheapPathFunction(
   (path: string) => {
     try {
       return optimisticLStat(path);
-    } catch (e) {
+    } catch (e: any) {
       if (e.code !== "ENOENT") throw e;
       dependOnParentDirectory(path);
       return null;
@@ -282,7 +282,7 @@ export const optimisticHashOrNull = makeOptimistic("hashOrNull", (
   try {
     return sha1(optimisticReadFile(path, options)) as string;
 
-  } catch (e) {
+  } catch (e: any) {
     if (e.code !== "EISDIR" &&
         e.code !== "ENOENT") {
       throw e;
@@ -309,7 +309,7 @@ makeOptimistic("readJsonOrNull", (
   let contents: string | Buffer;
   try {
     contents = optimisticReadFile(path, options);
-  } catch (e) {
+  } catch (e: any) {
     if (e.code === "ENOENT") {
       dependOnParentDirectory(path);
       return null;
@@ -338,18 +338,37 @@ makeOptimistic("readJsonOrNull", (
   }
 });
 
-export const optimisticReadMeteorIgnore = wrap((dir: string) => {
-  const meteorIgnorePath = pathJoin(dir, ".meteorignore");
-  const meteorIgnoreStat = optimisticStatOrNull(meteorIgnorePath);
+export function optimisticReadMeteorIgnore(
+  meteorIgnorePath: string | null,
+  customMeteorIgnore?: string,
+  rootMeteorIgnore?: string
+) {
+  // Another directory can trigger a rebuild before this file's watcher fires.
+  // Read listed ignore files fresh; a null path needs no filesystem access.
+  const contents = meteorIgnorePath !== null &&
+      statOrNull(meteorIgnorePath)?.isFile()
+    ? readFileOrNull(meteorIgnorePath)?.toString("utf8") ?? null
+    : null;
 
-  if (meteorIgnoreStat &&
-      meteorIgnoreStat.isFile()) {
-    return ignore().add(
-      optimisticReadFile(meteorIgnorePath).toString("utf8")
-    );
+  return optimisticParseMeteorIgnore(contents, customMeteorIgnore, rootMeteorIgnore);
+}
+
+const optimisticParseMeteorIgnore = wrap((
+  contents: string | null,
+  customMeteorIgnore?: string,
+  rootMeteorIgnore?: string
+) => {
+  let ignoreConfig = contents === null ? null : ignore().add(contents);
+
+  // Explicit arguments also keep environment changes in the cache key.
+  for (const patterns of [customMeteorIgnore, rootMeteorIgnore]) {
+    if (patterns != null) {
+      ignoreConfig = ignoreConfig || ignore();
+      ignoreConfig = ignoreConfig.add(patterns.trim().split(/\s+/));
+    }
   }
 
-  return null;
+  return ignoreConfig;
 });
 
 type LookupPkgJsonType = OptimisticWrapperFunction<
@@ -399,7 +418,7 @@ wrap((absRootDir: string, relDir: string) => {
 const optimisticIsSymbolicLink = wrap((path: string) => {
   try {
     return lstat(path)?.isSymbolicLink();
-  } catch (e) {
+  } catch (e: any) {
     if (e.code !== "ENOENT") throw e;
     dependOnParentDirectory(path);
     return false;

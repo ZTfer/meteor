@@ -1,6 +1,6 @@
 Package.describe({
   summary: "Google OAuth flow",
-  version: "1.4.1",
+  version: '1.5.1',
 });
 
 Cordova.depends({
@@ -11,7 +11,7 @@ Package.onUse(api => {
   api.use("ecmascript");
   api.use('oauth2', ['client', 'server']);
   api.use('oauth', ['client', 'server']);
-  api.use('http@1.4.4 || 2.0.0', ['server']);
+  api.use('fetch', ['server']);
   api.use('service-configuration');
   api.use('random', 'client');
 
@@ -22,4 +22,12 @@ Package.onUse(api => {
   api.mainModule('namespace.js');
 
   api.export('Google');
+  api.types('google-oauth.d.ts');
+});
+
+Package.onTest(function(api) {
+  api.use('google-oauth');
+  api.use(['tinytest', 'ecmascript', 'test-helpers', 'oauth', 'oauth2', 'service-configuration', 'random']);
+  api.use('accounts-base', 'server');
+  api.addFiles('google-oauth_tests.js');
 });

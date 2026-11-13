@@ -1,14 +1,15 @@
 Package.describe({
   summary: "Encrypt account secrets stored in the database",
-  version: '1.3.2',
+  version: '1.3.4',
 });
 
 Package.onUse(api => {
   api.use('ecmascript', 'server');
-  api.use("modules@0.7.5", "server");
-  api.use("ejson@1.0.12", "server");
+  api.use("modules@0.19.1-beta300.7", "server");
+  api.use("ejson@1.1.3", "server");
   api.mainModule("encrypt.js", "server");
   api.export("OAuthEncryption", "server");
+  api.types("oauth-encryption.d.ts");
 });
 
 Package.onTest(api => {

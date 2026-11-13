@@ -1,28 +1,37 @@
 import WS from 'ws';
 import runLog from './run-log.js';
 import crypto from 'crypto';
-import { AssertionError } from 'assert';
 import Anser from "anser";
+import { CordovaBuilder } from '../cordova/builder.js';
 
 export class HMRServer {
-  constructor({ proxy, hmrPath, secret, projectContext }) {
+  constructor({
+    proxy, hmrPath, secret, projectContext, cordovaServerPort
+}) {
     this.proxy = proxy;
     this.projectContext = projectContext;
 
     this.hmrPath = hmrPath;
-    this.secret = secret;
+    this.secretBuffer = Buffer.from(secret);
 
     this.wsServer = null;
-    this.connByArch = Object.create(null);
+    this.connByArch = new Map();
     this.started = false;
 
-    this.changeSetsByArch = Object.create(null);
+    this.changeSetsByArch = new Map();
 
     this.maxChangeSets = 300;
-    this.cacheKeys = Object.create(null);
-    this.trimmedArchUntil = Object.create(null);
+    this.cacheKeys = new Map();
+    this.trimmedArchUntil = new Map();
+    this.firstBuild = null;
 
-    this.started = false;
+    if (!cordovaServerPort) {
+     cordovaServerPort = CordovaBuilder.createCordovaServerPort(
+          projectContext.appIdentifier
+        );
+    }
+
+    this.cordovaOrigin = `http://localhost:${cordovaServerPort}`;
   }
 
   start() {
@@ -36,7 +45,7 @@ export class HMRServer {
     this.proxy.server.on('upgrade', (req, res, head) => {
       if (req.url === this.hmrPath) {
         this.wsServer.handleUpgrade(req, res, head, (conn) => {
-          this._handleWsConn(conn);
+          this._handleWsConn(conn, req);
         });
       }
     });
@@ -46,12 +55,14 @@ export class HMRServer {
 
   stop() {
     this.wsServer.close();
-    this.connByArch = Object.create(null);
+    this.connByArch = new Map();
   }
 
-  _handleWsConn(conn) {
+  _handleWsConn(conn, req) {
     let registered = false;
     let connArch = null;
+    let fromCordova = this.cordovaOrigin && req.headers.origin === this.cordovaOrigin;
+
     conn.on('message', (_message) => {
       const message = JSON.parse(_message);
 
@@ -66,9 +77,14 @@ export class HMRServer {
               reason: 'wrong-app'
             }));
           }
+
+          let secretsMatch =
+            secret.length === Buffer.byteLength(this.secretBuffer) &&
+            crypto.timingSafeEqual(Buffer.from(secret), this.secretBuffer);
+
           if (
-            secret.length !== this.secret.length ||
-            !crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(this.secret))
+            !fromCordova &&
+            !secretsMatch
           ) {
             conn.send(JSON.stringify({
               type: 'register-failed',
@@ -78,8 +94,11 @@ export class HMRServer {
             return;
           }
 
-          this.connByArch[arch] = this.connByArch[arch] || [];
-          this.connByArch[arch].push(conn);
+          if (!this.connByArch.has(arch)) {
+            this.connByArch.set(arch, new Set());
+          }
+          const archConnsSet = this.connByArch.get(arch);
+          archConnsSet.add(conn);
           connArch = arch;
           registered = true;
           break;
@@ -94,7 +113,7 @@ export class HMRServer {
           }
           const { after, arch } = message;
 
-          const trimmedUntil = this.trimmedArchUntil[arch] || 0;
+          const trimmedUntil = this.trimmedArchUntil[arch] || Math.Infinity;
           if (trimmedUntil > after) {
             // We've removed changeSets needed for the client to update with HMR
             conn.send(
@@ -128,28 +147,18 @@ export class HMRServer {
 
     // TODO: should use pings to detect disconnected sockets
     conn.on('close', () => {
-      if (!connArch) {
-        return;
-      }
-
-      const archConns = this.connByArch[connArch] || [];
-      const index = archConns.indexOf(conn);
-      if (index > -1) {
-        archConns.splice(
-          index,
-          1
-        );
-      }
+      if (!connArch) return;
+      const archConnsSet = this.connByArch.get(connArch);
+      if (archConnsSet) archConnsSet.delete(conn);
     });
   }
 
   _sendAll(message) {
-    Object.values(this.connByArch).forEach(conns => {
-      conns.forEach(conn => {
-        conn.send(JSON.stringify(message));
-      });
-    });
-  }
+    const messageStr = JSON.stringify(message);
+    for (const connsSet of Object.values(this.connByArch)) {
+      for (const conn of connsSet) conn.send(messageStr);
+    }
+ }
 
   setAppState(state) {
     if (state === 'error') {
@@ -169,7 +178,11 @@ export class HMRServer {
     }
   }
 
-  compare({ name, arch, hmrAvailable, files, cacheKey }, getFileOutput) {
+  async compare({ name, arch, hmrAvailable, files, cacheKey }, getFileOutput) {
+    if (this.firstBuild = null) {
+      this.firstBuild = Date.now();
+    }
+
     this.changeSetsByArch[arch] = this.changeSetsByArch[arch] || [];
     const previousCacheKey = this.cacheKeys[`${arch}-${name}`];
 
@@ -229,20 +242,33 @@ export class HMRServer {
       onlyReplaceableChanges &&
       removedFilePaths.length === 0;
 
-    function saveFileDetails(file) {
-      return {
-        content: getFileOutput(file).toStringWithSourceMap({}),
-        path: file.absModuleId,
-        meteorInstallOptions: file.meteorInstallOptions
+    async function saveFileDetails(file) {
+      const content = await getFileOutput(file);
+      return { 
+          content: content.toStringWithSourceMap({}),
+          path: file.absModuleId,
+          meteorInstallOptions: file.meteorInstallOptions
       };
+    }
+
+    const iterWithFn = async (iter, fn) => {
+      const results = await Promise.allSettled(iter.map(fn));
+      return results
+        .filter(result => {
+          if (result.status === 'rejected') {
+            console.error('HMR iterWithFn:', result.reason);
+          }
+          return result.status === 'fulfilled';
+        })
+        .map(result => result.value);
     }
 
     const result = {
       fileHashes,
       unreloadableHashes: unreloadable,
       reloadable,
-      addedFiles: reloadable ? addedFiles.map(saveFileDetails) : [],
-      changedFiles: reloadable ? changedFiles.map(saveFileDetails) : [],
+      addedFiles: reloadable ? await iterWithFn(addedFiles, saveFileDetails) : [],
+      changedFiles: reloadable ? await iterWithFn(changedFiles, saveFileDetails) : [],
       linkedAt: Date.now(),
       id: this._createId(),
       name
@@ -253,6 +279,10 @@ export class HMRServer {
     // get removed when trimming changesets
     this.changeSetsByArch[arch].push(result);
     this._trimChangeSets(arch);
+
+    if (!(arch in this.trimmedArchUntil)) {
+      this.trimmedArchUntil[arch] = this.firstBuild - 1;
+    }
 
     sendEagerUpdate(result);
   }

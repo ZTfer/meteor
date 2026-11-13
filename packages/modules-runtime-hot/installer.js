@@ -220,8 +220,8 @@ makeInstaller = function (options) {
     var file = fileResolve(filesByModuleId[this.id], id);
     if (file) return file.module.id;
     var error = makeMissingError(id);
-    if (fallback && isFunction(fallback.resolve)) {
-      return fallback.resolve(id, this.id, error);
+    if (fallback && isFunction(fallback)) {
+      return fallback(id, this.id, error);
     }
     throw error;
   };
@@ -236,7 +236,7 @@ makeInstaller = function (options) {
 
       for (var i = 0; i < hookCount; i++) {
         if (requireHooks[i].before) {
-          hookData.push(requireHooks[i].before(result.module, this.id));
+          hookData[i] = requireHooks[i].before(result.module, this.id);
         }
       }
 

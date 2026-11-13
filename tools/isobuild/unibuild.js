@@ -93,7 +93,7 @@ export class Unibuild {
     });
   }
 
-  static fromJSON(unibuildJson, {
+  static async fromJSON(unibuildJson, {
     isopack,
     // At some point we stopped writing 'kind's to the metadata file, so
     // default to main.
@@ -153,7 +153,10 @@ export class Unibuild {
           usesDefaultSourceProcessor: true,
           legacyPrelink: {
             packageVariables: unibuildJson.packageVariables || []
-          }
+          },
+          // Only published packages still use prelink resources,
+          // so there is no need to mark this file to be watched
+          _dataUsed: false
         };
 
         if (resource.sourceMap) {
@@ -179,7 +182,8 @@ export class Unibuild {
           type: resource.type,
           data: data,
           servePath: resource.servePath || undefined,
-          path: resource.path || undefined
+          path: resource.path || undefined,
+          fileOptions: resource.fileOptions || undefined,
         });
 
       } else {
@@ -206,7 +210,7 @@ export class Unibuild {
     }
 
     const nodeModulesDirectories =
-      NodeModulesDirectory.readDirsFromJSON(unibuildJson.node_modules, {
+      await NodeModulesDirectory.readDirsFromJSON(unibuildJson.node_modules, {
         packageName: isopack.name,
         sourceRoot: unibuildBasePath,
         // Rebuild binary npm packages if unibuild arch matches host arch.
@@ -225,7 +229,7 @@ export class Unibuild {
     });
   }
 
-  toJSON({
+  async toJSON({
     builder,
     unibuildDir,
     usesModules,
@@ -249,14 +253,14 @@ export class Unibuild {
 
     // Figure out where the npm dependencies go.
     let node_modules = {};
-    _.each(unibuild.nodeModulesDirectories, nmd => {
+    for (const nmd of Object.values(unibuild.nodeModulesDirectories)) {
       const bundlePath = _.has(npmDirsToCopy, nmd.sourcePath)
-      // We already have this npm directory from another unibuild.
-        ? npmDirsToCopy[nmd.sourcePath]
-        : npmDirsToCopy[nmd.sourcePath] =
-            nmd.getPreferredBundlePath("isopack");
-      node_modules[bundlePath] = nmd.toJSON();
-    });
+          // We already have this npm directory from another unibuild.
+          ? npmDirsToCopy[nmd.sourcePath]
+          : npmDirsToCopy[nmd.sourcePath] =
+              nmd.getPreferredBundlePath("isopack");
+      node_modules[bundlePath] = await nmd.toJSON();
+    }
 
     const preferredPaths = Object.keys(node_modules);
     if (preferredPaths.length === 1) {
@@ -304,19 +308,19 @@ export class Unibuild {
       }
     });
 
-    _.each(concat, function (parts, type) {
+    for (const [type, parts] of Object.entries(concat)) {
       if (parts.length) {
-        builder.write(files.pathJoin(unibuildDir, type), {
+        await builder.write(files.pathJoin(unibuildDir, type), {
           data: Buffer.concat(concat[type], offset[type])
         });
       }
-    });
+    }
 
     // Output other resources each to their own file
-    _.each(unibuild.resources, function (resource) {
+    for (const resource of unibuild.resources) {
       if (["head", "body"].includes(resource.type)) {
         // already did this one
-        return;
+        continue;
       }
 
       let data;
@@ -326,21 +330,26 @@ export class Unibuild {
         data = resource.data;
       }
 
+      const resourceOutputPath = resource.servePath || resource.path;
+      const serializedResourcePath =
+        resource.fileOptions && resource.fileOptions.nativeType
+          ? resourceOutputPath + '.meteor-type'
+          : resourceOutputPath;
       const generatedFilename =
-        builder.writeToGeneratedFilename(
-          files.pathJoin(
-            unibuildDir,
-            resource.servePath || resource.path,
-          ),
-          { data }
-        );
+          await builder.writeToGeneratedFilename(
+              files.pathJoin(
+                  unibuildDir,
+                  serializedResourcePath,
+              ),
+              { data }
+          );
 
       if (! usesModules &&
           resource.fileOptions &&
           resource.fileOptions.lazy) {
         // Omit lazy resources from the unibuild JSON file, but only after
         // they are copied into the bundle (immediately above).
-        return;
+        continue;
       }
 
       unibuildJson.resources.push({
@@ -350,13 +359,13 @@ export class Unibuild {
         length: data.length,
         offset: 0,
         usesDefaultSourceProcessor:
-          resource.usesDefaultSourceProcessor || undefined,
+            resource.usesDefaultSourceProcessor || undefined,
         servePath: resource.servePath || undefined,
         path: resource.path || undefined,
         hash: resource._hash || resource.hash || undefined,
         fileOptions: resource.fileOptions || undefined
       });
-    });
+    }
 
     return unibuildJson;
   }

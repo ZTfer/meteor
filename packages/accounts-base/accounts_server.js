@@ -1,12 +1,13 @@
 import crypto from 'crypto';
+import { Meteor } from 'meteor/meteor'
+import { check, Match } from 'meteor/check';
 import {
   AccountsCommon,
   EXPIRE_TOKENS_INTERVAL_MS,
-  CONNECTION_CLOSE_DELAY_MS
 } from './accounts_common.js';
 import { URL } from 'meteor/url';
+export const _CurrentEndpointInvocation = new Meteor.EnvironmentVariable();
 
-const hasOwn = Object.prototype.hasOwnProperty;
 
 /**
  * @summary Constructor for the `Accounts` namespace on the server.
@@ -20,8 +21,8 @@ export class AccountsServer extends AccountsCommon {
   // Note that this constructor is less likely to be instantiated multiple
   // times than the `AccountsClient` constructor, because a single server
   // can provide only one set of methods.
-  constructor(server) {
-    super();
+  constructor(server, options) {
+    super(options || {});
 
     this._server = server || Meteor.server;
     // Set up the server's methods, as if by calling Meteor.methods.
@@ -65,8 +66,6 @@ export class AccountsServer extends AccountsCommon {
 
     // list of all registered handlers.
     this._loginHandlers = [];
-
-    setupUsersCollection(this.users);
     setupDefaultLoginHandlers(this);
     setExpireTokensInterval(this);
 
@@ -79,14 +78,50 @@ export class AccountsServer extends AccountsCommon {
 
     this._skipCaseInsensitiveChecksForTest = {};
 
+    // Helper function to resolve promises if needed
+    this._resolvePromise = async (value) => {
+      return Meteor._isPromise(value) ? await value : value;
+    };
+
+    /**
+     * @summary Object containing functions that generate URLs for account-related emails.
+     * Override these to customize URLs in emails sent by
+     * [`Accounts.sendResetPasswordEmail`](#Accounts-sendResetPasswordEmail),
+     * [`Accounts.sendEnrollmentEmail`](#Accounts-sendEnrollmentEmail), and
+     * [`Accounts.sendVerificationEmail`](#Accounts-sendVerificationEmail).
+     *
+     * By default, URLs use hash fragments (e.g., `#/reset-password/:token`) for security:
+     * hash fragments are not sent to the server in HTTP requests, preventing tokens from
+     * appearing in server logs or referrer headers.
+     * @locus Server
+     * @memberof Accounts
+     * @name urls
+     * @type {Object}
+     * @property {Function} resetPassword - `(token, extraParams) => string` - Generates password reset URL.
+     * @property {Function} verifyEmail - `(token, extraParams) => string` - Generates email verification URL.
+     * @property {Function} enrollAccount - `(token, extraParams) => string` - Generates account enrollment URL.
+     * @property {Function} loginToken - `(selector, token, extraParams) => string` - Generates login token URL.
+     */
     this.urls = {
       resetPassword: (token, extraParams) => this.buildEmailUrl(`#/reset-password/${token}`, extraParams),
       verifyEmail: (token, extraParams) => this.buildEmailUrl(`#/verify-email/${token}`, extraParams),
+      loginToken: (selector, token, extraParams) =>
+        this.buildEmailUrl(`/?loginToken=${token}&selector=${selector}`, extraParams),
       enrollAccount: (token, extraParams) => this.buildEmailUrl(`#/enroll-account/${token}`, extraParams),
     };
 
     this.addDefaultRateLimit();
 
+    /**
+     * @summary Builds a URL for account-related emails by combining the app's
+     * root URL with a path and optional extra parameters.
+     * @locus Server
+     * @memberof Accounts
+     * @name buildEmailUrl
+     * @param {String} path - The path to append to the root URL (e.g., `#/reset-password/TOKEN`).
+     * @param {Object} [extraParams={}] - Additional query parameters to include in the URL.
+     * @returns {String} The complete URL.
+     */
     this.buildEmailUrl = (path, extraParams = {}) => {
       const url = new URL(Meteor.absoluteUrl(path));
       const params = Object.entries(extraParams);
@@ -98,7 +133,11 @@ export class AccountsServer extends AccountsCommon {
       }
       return url.toString();
     };
+
+    // Expose the _CurrentEndpointInvocation
+    this._CurrentEndpointInvocation = _CurrentEndpointInvocation;
   }
+
 
   ///
   /// CURRENT USER
@@ -112,10 +151,20 @@ export class AccountsServer extends AccountsCommon {
     // runs. This is likely not what the user expects. The way to make this work
     // in a method or publish function is to do Meteor.find(this.userId).observe
     // and recompute when the user record changes.
-    const currentInvocation = DDP._CurrentMethodInvocation.get() || DDP._CurrentPublicationInvocation.get();
-    if (!currentInvocation)
-      throw new Error("Meteor.userId can only be invoked in method calls or publications.");
+    const currentInvocation =
+      DDP._CurrentMethodInvocation.get() ||
+      DDP._CurrentPublicationInvocation.get() ||
+      this._CurrentEndpointInvocation.get();
+    if (!currentInvocation) {
+      throw new Error(
+        "Meteor.userId can only be invoked inside a method, publication, or WebApp endpoint."
+      );
+    }
     return currentInvocation.userId;
+  }
+
+  async init() {
+    await setupUsersCollection(this.users);
   }
 
   ///
@@ -159,6 +208,20 @@ export class AccountsServer extends AccountsCommon {
   ///
 
   /**
+   * @summary Customize login token creation.
+   * @locus Server
+   * @param {Function} func Called whenever a new token is created.
+   * Return the sequence and the user object. Return true to keep sending the default email, or false to override the behavior.
+   */
+  onCreateLoginToken = function(func) {
+    if (this._onCreateLoginTokenHook) {
+      throw new Error('Can only call onCreateLoginToken once');
+    }
+
+    this._onCreateLoginTokenHook = func;
+  }
+
+  /**
    * @summary Customize new user creation.
    * @locus Server
    * @param {Function} func Called whenever a new user is created. Return the new user object, or throw an `Error` to abort the creation.
@@ -168,7 +231,7 @@ export class AccountsServer extends AccountsCommon {
       throw new Error("Can only call onCreateUser once");
     }
 
-    this._onCreateUserHook = func;
+    this._onCreateUserHook = Meteor.wrapFn(func);
   }
 
   /**
@@ -190,18 +253,18 @@ export class AccountsServer extends AccountsCommon {
    * @param {Function} func Called whenever a user is logged in via oauth and a
    * user is not found with the service id. Return the user or undefined.
    */
-   setAdditionalFindUserOnExternalLogin(func) {
+  setAdditionalFindUserOnExternalLogin(func) {
     if (this._additionalFindUserOnExternalLogin) {
       throw new Error("Can only call setAdditionalFindUserOnExternalLogin once");
     }
     this._additionalFindUserOnExternalLogin = func;
   }
 
-  _validateLogin(connection, attempt) {
-    this._validateLoginHook.each(callback => {
+  async _validateLogin(connection, attempt) {
+    await this._validateLoginHook.forEachAsync(async (callback) => {
       let ret;
       try {
-        ret = callback(cloneAttemptWithConnection(connection, attempt));
+        ret = await callback(cloneAttemptWithConnection(connection, attempt));
       }
       catch (e) {
         attempt.allowed = false;
@@ -223,29 +286,116 @@ export class AccountsServer extends AccountsCommon {
     });
   };
 
-  _successfulLogin(connection, attempt) {
-    this._onLoginHook.each(callback => {
-      callback(cloneAttemptWithConnection(connection, attempt));
+  async _successfulLogin(connection, attempt) {
+    await this._onLoginHook.forEachAsync(async (callback) => {
+      await callback(cloneAttemptWithConnection(connection, attempt));
       return true;
     });
   };
 
-  _failedLogin(connection, attempt) {
-    this._onLoginFailureHook.each(callback => {
-      callback(cloneAttemptWithConnection(connection, attempt));
+  async _failedLogin(connection, attempt) {
+    await this._onLoginFailureHook.forEachAsync(async (callback) => {
+      await callback(cloneAttemptWithConnection(connection, attempt));
       return true;
     });
   };
 
-  _successfulLogout(connection, userId) {
+  async _successfulLogout(connection, userId) {
     // don't fetch the user object unless there are some callbacks registered
     let user;
-    this._onLogoutHook.each(callback => {
-      if (!user && userId) user = this.users.findOne(userId, {fields: this._options.defaultFieldSelector});
+    await this._onLogoutHook.forEachAsync(async callback => {
+      if (!user && userId) user = await this.users.findOneAsync(userId, { fields: this._options.defaultFieldSelector });
       callback({ user, connection });
       return true;
     });
   };
+
+  // Generates a MongoDB selector that can be used to perform a fast case
+  // insensitive lookup for the given fieldName and string. Since MongoDB does
+  // not support case insensitive indexes, and case insensitive regex queries
+  // are slow, we construct a set of prefix selectors for all permutations of
+  // the first 4 characters ourselves. We first attempt to matching against
+  // these, and because 'prefix expression' regex queries do use indexes (see
+  // http://docs.mongodb.org/v2.6/reference/operator/query/regex/#index-use),
+  // this has been found to greatly improve performance (from 1200ms to 5ms in a
+  // test with 1.000.000 users).
+  _selectorForFastCaseInsensitiveLookup = (fieldName, string) => {
+    // Performance seems to improve up to 4 prefix characters
+    const prefix = string.substring(0, Math.min(string.length, 4));
+    const orClause = generateCasePermutationsForString(prefix).map(
+        prefixPermutation => {
+          const selector = {};
+          selector[fieldName] =
+              new RegExp(`^${Meteor._escapeRegExp(prefixPermutation)}`);
+          return selector;
+        });
+    const caseInsensitiveClause = {};
+    caseInsensitiveClause[fieldName] =
+        new RegExp(`^${Meteor._escapeRegExp(string)}$`, 'i')
+    return {$and: [{$or: orClause}, caseInsensitiveClause]};
+  }
+
+  _findUserByQuery = async (query, options) => {
+    let user = null;
+
+    if (query.id) {
+      // default field selector is added within getUserById()
+      user = await Meteor.users.findOneAsync(query.id, this._addDefaultFieldSelector(options));
+    } else {
+      options = this._addDefaultFieldSelector(options);
+      let fieldName;
+      let fieldValue;
+      if (query.username) {
+        fieldName = 'username';
+        fieldValue = query.username;
+      } else if (query.email) {
+        fieldName = 'emails.address';
+        fieldValue = query.email;
+      } else {
+        throw new Error("shouldn't happen (validation missed something)");
+      }
+      let selector = {};
+      selector[fieldName] = fieldValue;
+      user = await Meteor.users.findOneAsync(selector, options);
+      // If user is not found, try a case insensitive lookup
+      if (!user) {
+        selector = this._selectorForFastCaseInsensitiveLookup(fieldName, fieldValue);
+        const candidateUsers = await Meteor.users.find(selector, { ...options, limit: 2 }).fetchAsync();
+        // No match if multiple candidates are found
+        if (candidateUsers.length === 1) {
+          user = candidateUsers[0];
+        }
+      }
+    }
+
+    return user;
+  }
+
+  /**
+   * @summary Find a user by one of their email addresses.
+   * @locus Server
+   * @param {String} email The email address to look for
+   * @param {Object} [options]
+   * @param {Object} options.fields Limit the fields to return from the user document
+   * @returns {Promise<Object>} A user if found, else null
+   * @memberof Accounts
+   * @importFromPackage accounts-base
+   */
+  findUserByEmail = async (email, options) =>
+    await this._findUserByQuery({ email }, options);
+
+  /**
+   * @summary Find a user by their username.
+   * @locus Server
+   * @param {String} username The username to look for
+   * @param {Object} [options]
+   * @param {Object} options.fields Limit the fields to return from the user document
+   * @returns {Promise<Object>} A user if found, else null
+   * @memberof Accounts
+   * @importFromPackage accounts-base
+   */
+  findUserByUsername = async (username, options) =>
+    await this._findUserByQuery({ username }, options);
 
   ///
   /// LOGIN METHODS
@@ -316,10 +466,10 @@ export class AccountsServer extends AccountsCommon {
   // indicates that the login token has already been inserted into the
   // database and doesn't need to be inserted again.  (It's used by the
   // "resume" login handler).
-  _loginUser(methodInvocation, userId, stampedLoginToken) {
+  async _loginUser(methodInvocation, userId, stampedLoginToken) {
     if (! stampedLoginToken) {
       stampedLoginToken = this._generateStampedLoginToken();
-      this._insertLoginToken(userId, stampedLoginToken);
+      await this._insertLoginToken(userId, stampedLoginToken);
     }
 
     // This order (and the avoidance of yields) is important to make
@@ -336,7 +486,7 @@ export class AccountsServer extends AccountsCommon {
       )
     );
 
-    methodInvocation.setUserId(userId);
+    await methodInvocation.setUserId(userId);
 
     return {
       id: userId,
@@ -352,7 +502,7 @@ export class AccountsServer extends AccountsCommon {
   // If the login is allowed and isn't aborted by a validate login hook
   // callback, log in the user.
   //
-  _attemptLogin(
+  async _attemptLogin(
     methodInvocation,
     methodName,
     methodArgs,
@@ -369,7 +519,7 @@ export class AccountsServer extends AccountsCommon {
 
     let user;
     if (result.userId)
-      user = this.users.findOne(result.userId, {fields: this._options.defaultFieldSelector});
+      user = await this.users.findOneAsync(result.userId, {fields: this._options.defaultFieldSelector});
 
     const attempt = {
       type: result.type || "unknown",
@@ -387,23 +537,24 @@ export class AccountsServer extends AccountsCommon {
     // _validateLogin may mutate `attempt` by adding an error and changing allowed
     // to false, but that's the only change it can make (and the user's callbacks
     // only get a clone of `attempt`).
-    this._validateLogin(methodInvocation.connection, attempt);
+    await this._validateLogin(methodInvocation.connection, attempt);
 
     if (attempt.allowed) {
+      const o = await this._loginUser(
+        methodInvocation,
+        result.userId,
+        result.stampedLoginToken
+      )
       const ret = {
-        ...this._loginUser(
-          methodInvocation,
-          result.userId,
-          result.stampedLoginToken
-        ),
+        ...o,
         ...result.options
       };
       ret.type = attempt.type;
-      this._successfulLogin(methodInvocation.connection, attempt);
+      await this._successfulLogin(methodInvocation.connection, attempt);
       return ret;
     }
     else {
-      this._failedLogin(methodInvocation.connection, attempt);
+      await this._failedLogin(methodInvocation.connection, attempt);
       throw attempt.error;
     }
   };
@@ -412,7 +563,7 @@ export class AccountsServer extends AccountsCommon {
   // Ensure that thrown exceptions are caught and that login hook
   // callbacks are still called.
   //
-  _loginMethod(
+  async _loginMethod(
     methodInvocation,
     methodName,
     methodArgs,
@@ -423,7 +574,7 @@ export class AccountsServer extends AccountsCommon {
       methodInvocation,
       methodName,
       methodArgs,
-      tryLoginMethod(type, fn)
+      await tryLoginMethod(type, fn)
     );
   };
 
@@ -435,7 +586,7 @@ export class AccountsServer extends AccountsCommon {
   // is no corresponding method for a successful login; methods that can
   // succeed at logging a user in should always be actual login methods
   // (using either Accounts._loginMethod or Accounts.registerLoginHandler).
-  _reportLoginFailure(
+  async _reportLoginFailure(
     methodInvocation,
     methodName,
     methodArgs,
@@ -450,11 +601,11 @@ export class AccountsServer extends AccountsCommon {
     };
 
     if (result.userId) {
-      attempt.user = this.users.findOne(result.userId, {fields: this._options.defaultFieldSelector});
+      attempt.user = await this.users.findOneAsync(result.userId, {fields: this._options.defaultFieldSelector});
     }
 
-    this._validateLogin(methodInvocation.connection, attempt);
-    this._failedLogin(methodInvocation.connection, attempt);
+    await this._validateLogin(methodInvocation.connection, attempt);
+    await this._failedLogin(methodInvocation.connection, attempt);
 
     // _validateLogin may mutate attempt to set a new error message. Return
     // the modified version.
@@ -465,19 +616,14 @@ export class AccountsServer extends AccountsCommon {
   /// LOGIN HANDLERS
   ///
 
-  // The main entry point for auth packages to hook in to login.
-  //
-  // A login handler is a login method which can return `undefined` to
-  // indicate that the login request is not handled by this handler.
-  //
-  // @param name {String} Optional.  The service name, used by default
-  // if a specific service name isn't returned in the result.
-  //
-  // @param handler {Function} A function that receives an options object
-  // (as passed as an argument to the `login` method) and returns one of:
-  // - `undefined`, meaning don't handle;
-  // - a login method result object
-
+  /**
+   * @summary Registers a new login handler.
+   * @locus Server
+   * @param {String} [name] The type of login method like oauth, password, etc.
+   * @param {Function} handler A function that receives an options object
+   * (as passed as an argument to the `login` method) and returns one of
+   * `undefined`, meaning don't handle or a login method result object.
+   */
   registerLoginHandler(name, handler) {
     if (! handler) {
       handler = name;
@@ -486,7 +632,7 @@ export class AccountsServer extends AccountsCommon {
 
     this._loginHandlers.push({
       name: name,
-      handler: handler
+      handler: Meteor.wrapFn(handler)
     });
   };
 
@@ -505,11 +651,10 @@ export class AccountsServer extends AccountsCommon {
   // Try all of the registered login handlers until one of them doesn't
   // return `undefined`, meaning it handled this call to `login`. Return
   // that return value.
-  _runLoginHandlers(methodInvocation, options) {
+  async _runLoginHandlers(methodInvocation, options) {
     for (let handler of this._loginHandlers) {
-      const result = tryLoginMethod(
-        handler.name,
-        () => handler.handler.call(methodInvocation, options)
+      const result = await tryLoginMethod(handler.name, async () =>
+        await handler.handler.call(methodInvocation, options)
       );
 
       if (result) {
@@ -517,7 +662,10 @@ export class AccountsServer extends AccountsCommon {
       }
 
       if (result !== undefined) {
-        throw new Meteor.Error(400, "A login handler should return a result or undefined");
+        throw new Meteor.Error(
+          400,
+          'A login handler should return a result or undefined'
+        );
       }
     }
 
@@ -535,8 +683,8 @@ export class AccountsServer extends AccountsCommon {
   // Any connections associated with old-style unhashed tokens will be
   // in the process of becoming associated with hashed tokens and then
   // they'll get closed.
-  destroyToken(userId, loginToken) {
-    this.users.update(userId, {
+  async destroyToken(userId, loginToken) {
+    await this.users.updateAsync(userId, {
       $pull: {
         "services.resume.loginTokens": {
           $or: [
@@ -553,7 +701,6 @@ export class AccountsServer extends AccountsCommon {
     // this variable is available in their scope.
     const accounts = this;
 
-
     // This object will be populated with methods and then passed to
     // accounts._server.methods further below.
     const methods = {};
@@ -562,24 +709,36 @@ export class AccountsServer extends AccountsCommon {
     //   If successful, returns {token: reconnectToken, id: userId}
     //   If unsuccessful (for example, if the user closed the oauth login popup),
     //     throws an error describing the reason
-    methods.login = function (options) {
+    methods.login = async function (options) {
       // Login handlers should really also check whatever field they look at in
       // options, but we don't enforce it.
       check(options, Object);
 
-      const result = accounts._runLoginHandlers(this, options);
+      const result = await accounts._runLoginHandlers(this, options);
+      //console.log({result});
 
       return accounts._attemptLogin(this, "login", arguments, result);
     };
 
-    methods.logout = function () {
+    methods.logout = async function () {
       const token = accounts._getLoginToken(this.connection.id);
       accounts._setLoginToken(this.userId, this.connection, null);
       if (token && this.userId) {
-        accounts.destroyToken(this.userId, token);
+       await accounts.destroyToken(this.userId, token);
       }
-      accounts._successfulLogout(this.connection, this.userId);
-      this.setUserId(null);
+      await accounts._successfulLogout(this.connection, this.userId);
+      await this.setUserId(null);
+    };
+
+    // Logs out the current user and closes all the connections
+    // associated with the user.
+    //
+    methods.logoutAllClients = async function() {
+      const logoutUserId = this.userId;
+      accounts._setLoginToken(logoutUserId, this.connection, null);
+      accounts._clearAllLoginTokens(logoutUserId);
+      await accounts._successfulLogout(this.connection, logoutUserId);
+      await this.setUserId(null);
     };
 
     // Generates a new login token with the same expiration as the
@@ -590,8 +749,8 @@ export class AccountsServer extends AccountsCommon {
     // @returns Object
     //   If successful, returns { token: <new token>, id: <user id>,
     //   tokenExpires: <expiration date> }.
-    methods.getNewToken = function () {
-      const user = accounts.users.findOne(this.userId, {
+    methods.getNewToken = async function () {
+      const user = await accounts.users.findOneAsync(this.userId, {
         fields: { "services.resume.loginTokens": 1 }
       });
       if (! this.userId || ! user) {
@@ -610,19 +769,19 @@ export class AccountsServer extends AccountsCommon {
       }
       const newStampedToken = accounts._generateStampedLoginToken();
       newStampedToken.when = currentStampedToken.when;
-      accounts._insertLoginToken(this.userId, newStampedToken);
+      await accounts._insertLoginToken(this.userId, newStampedToken);
       return accounts._loginUser(this, this.userId, newStampedToken);
     };
 
     // Removes all tokens except the token associated with the current
     // connection. Throws an error if the connection is not logged
     // in. Returns nothing on success.
-    methods.removeOtherTokens = function () {
+    methods.removeOtherTokens = async function () {
       if (! this.userId) {
         throw new Meteor.Error("You are not logged in.");
       }
       const currentToken = accounts._getLoginToken(this.connection.id);
-      accounts.users.update(this.userId, {
+      await accounts.users.updateAsync(this.userId, {
         $pull: {
           "services.resume.loginTokens": { hashedToken: { $ne: currentToken } }
         }
@@ -631,7 +790,7 @@ export class AccountsServer extends AccountsCommon {
 
     // Allow a one-time configuration for a login service. Modifications
     // to this collection are also allowed in insecure mode.
-    methods.configureLoginService = (options) => {
+    methods.configureLoginService = async (options) => {
       check(options, Match.ObjectIncluding({service: String}));
       // Don't let random users configure a service we haven't added yet (so
       // that when we do later add it, it's set up with their configuration
@@ -644,14 +803,20 @@ export class AccountsServer extends AccountsCommon {
         throw new Meteor.Error(403, "Service unknown");
       }
 
-      const { ServiceConfiguration } = Package['service-configuration'];
-      if (ServiceConfiguration.configurations.findOne({service: options.service}))
-        throw new Meteor.Error(403, `Service ${options.service} already configured`);
+      if (Package['service-configuration']) {
+        const { ServiceConfiguration } = Package['service-configuration'];
+        const service = await ServiceConfiguration.configurations.findOneAsync({service: options.service})
+        if (service)
+          throw new Meteor.Error(403, `Service ${options.service} already configured`);
 
-      if (hasOwn.call(options, 'secret') && usingOAuthEncryption())
-        options.secret = OAuthEncryption.seal(options.secret);
+        if (Package["oauth-encryption"]) {
+          const { OAuthEncryption } = Package["oauth-encryption"]
+          if (Object.hasOwn(options, 'secret') && OAuthEncryption.keyIsLoaded())
+            options.secret = OAuthEncryption.seal(options.secret);
+        }
 
-      ServiceConfiguration.configurations.insert(options);
+        await ServiceConfiguration.configurations.insertAsync(options);
+      }
     };
 
     accounts._server.methods(methods);
@@ -672,24 +837,37 @@ export class AccountsServer extends AccountsCommon {
 
   _initServerPublications() {
     // Bring into lexical scope for publish callbacks that need `this`
-    const { users, _autopublishFields, _defaultPublishFields } = this;
+    const accounts = this;
+    const { _autopublishFields, _defaultPublishFields } = this;
 
     // Publish all login service configuration fields other than secret.
-    this._server.publish("meteor.loginServiceConfiguration", () => {
-      const { ServiceConfiguration } = Package['service-configuration'];
-      return ServiceConfiguration.configurations.find({}, {fields: {secret: 0}});
+    this._server.publish("meteor.loginServiceConfiguration", function() {
+      if (Package['service-configuration']) {
+        const { ServiceConfiguration } = Package['service-configuration'];
+        return ServiceConfiguration.configurations.find({}, {fields: {secret: 0}});
+      }
+      this.ready();
     }, {is_auto: true}); // not technically autopublish, but stops the warning.
 
     // Use Meteor.startup to give other packages a chance to call
     // setDefaultPublishFields.
     Meteor.startup(() => {
+      // Merge custom fields selector and default publish fields so that the client
+      // gets all the necessary fields to run properly
+      const customFields = this._addDefaultFieldSelector().fields || {};
+      const keys = Object.keys(customFields);
+      // If the custom fields are negative, then ignore them and only send the necessary fields
+      const fields = keys.length > 0 && customFields[keys[0]] ? {
+        ...this._addDefaultFieldSelector().fields,
+        ..._defaultPublishFields.projection
+      } : _defaultPublishFields.projection
       // Publish the current user's record to the client.
       this._server.publish(null, function () {
         if (this.userId) {
-          return users.find({
+          return accounts.users.find({
             _id: this.userId
           }, {
-            fields: _defaultPublishFields.projection,
+            fields,
           });
         } else {
           return null;
@@ -707,7 +885,7 @@ export class AccountsServer extends AccountsCommon {
       );
       this._server.publish(null, function () {
         if (this.userId) {
-          return users.find({ _id: this.userId }, {
+          return accounts.users.find({ _id: this.userId }, {
             fields: toFieldSelector(_autopublishFields.loggedInUser),
           })
         } else {
@@ -722,7 +900,7 @@ export class AccountsServer extends AccountsCommon {
       // function which filters out fields based on 'this.userId'.
       this._server.publish(null, function () {
         const selector = this.userId ? { _id: { $ne: this.userId } } : {};
-        return users.find(selector, {
+        return accounts.users.find(selector, {
           fields: toFieldSelector(_autopublishFields.otherUsers),
         })
       }, /*suppress autopublish warning*/{is_auto: true});
@@ -737,10 +915,8 @@ export class AccountsServer extends AccountsCommon {
   //   - forLoggedInUser {Array} Array of fields published to the logged-in user
   //   - forOtherUsers {Array} Array of fields published to users that aren't logged in
   addAutopublishFields(opts) {
-    this._autopublishFields.loggedInUser.push.apply(
-      this._autopublishFields.loggedInUser, opts.forLoggedInUser);
-    this._autopublishFields.otherUsers.push.apply(
-      this._autopublishFields.otherUsers, opts.forOtherUsers);
+    this._autopublishFields.loggedInUser.push(...(opts.forLoggedInUser || []));
+    this._autopublishFields.otherUsers.push(...(opts.forOtherUsers || []));
   };
 
   // Replaces the fields to be automatically
@@ -799,10 +975,10 @@ export class AccountsServer extends AccountsCommon {
   // Using $addToSet avoids getting an index error if another client
   // logging in simultaneously has already inserted the new hashed
   // token.
-  _insertHashedLoginToken(userId, hashedToken, query) {
+  async _insertHashedLoginToken(userId, hashedToken, query) {
     query = query ? { ...query } : {};
     query._id = userId;
-    this.users.update(query, {
+    await this.users.updateAsync(query, {
       $addToSet: {
         "services.resume.loginTokens": hashedToken
       }
@@ -810,19 +986,25 @@ export class AccountsServer extends AccountsCommon {
   };
 
   // Exported for tests.
-  _insertLoginToken(userId, stampedToken, query) {
-    this._insertHashedLoginToken(
+  async _insertLoginToken(userId, stampedToken, query) {
+    await this._insertHashedLoginToken(
       userId,
       this._hashStampedToken(stampedToken),
       query
     );
   };
 
+  /**
+   *
+   * @param userId
+   * @private
+   * @returns {Promise<void>}
+   */
   _clearAllLoginTokens(userId) {
-    this.users.update(userId, {
+    this.users.updateAsync(userId, {
       $set: {
-        'services.resume.loginTokens': []
-      }
+        'services.resume.loginTokens': [],
+      },
     });
   };
 
@@ -835,7 +1017,7 @@ export class AccountsServer extends AccountsCommon {
   // the observe that we started when we associated the connection with
   // this token.
   _removeTokenFromConnection(connectionId) {
-    if (hasOwn.call(this._userObservesForConnections, connectionId)) {
+    if (Object.hasOwn(this._userObservesForConnections, connectionId)) {
       const observe = this._userObservesForConnections[connectionId];
       if (typeof observe === 'number') {
         // We're in the process of setting up an observe for this connection. We
@@ -875,7 +1057,7 @@ export class AccountsServer extends AccountsCommon {
       // already -- in this case we just clean up the observe that we started).
       const myObserveNumber = ++this._nextUserObserveNumber;
       this._userObservesForConnections[connection.id] = myObserveNumber;
-      Meteor.defer(() => {
+      Meteor.defer(async () => {
         // If something else happened on this connection in the meantime (it got
         // closed, or another call to _setLoginToken happened), just do
         // nothing. We don't need to start an observe for an old connection or old
@@ -888,7 +1070,7 @@ export class AccountsServer extends AccountsCommon {
         // Because we upgrade unhashed login tokens to hashed tokens at
         // login time, sessions will only be logged in with a hashed
         // token. Thus we only need to observe hashed tokens here.
-        const observe = this.users.find({
+        const observe = await this.users.find({
           _id: userId,
           'services.resume.loginTokens.hashedToken': newToken
         }, { fields: { _id: 1 } }).observeChanges({
@@ -947,7 +1129,7 @@ export class AccountsServer extends AccountsCommon {
   // tests. oldestValidDate is simulate expiring tokens without waiting
   // for them to actually expire. userId is used by tests to only expire
   // tokens for the test user.
-  _expirePasswordResetTokens(oldestValidDate, userId) {
+  async _expirePasswordResetTokens(oldestValidDate, userId) {
     const tokenLifetimeMs = this._getPasswordResetTokenLifetimeMs();
 
     // when calling from a test with extra arguments, you must specify both!
@@ -965,7 +1147,7 @@ export class AccountsServer extends AccountsCommon {
       ]
     };
 
-    expirePasswordToken(this, oldestValidDate, tokenFilter, userId);
+   await expirePasswordToken(this, oldestValidDate, tokenFilter, userId);
   }
 
   // Deletes expired password enroll tokens from the database.
@@ -974,7 +1156,7 @@ export class AccountsServer extends AccountsCommon {
   // tests. oldestValidDate is simulate expiring tokens without waiting
   // for them to actually expire. userId is used by tests to only expire
   // tokens for the test user.
-  _expirePasswordEnrollTokens(oldestValidDate, userId) {
+  async _expirePasswordEnrollTokens(oldestValidDate, userId) {
     const tokenLifetimeMs = this._getPasswordEnrollTokenLifetimeMs();
 
     // when calling from a test with extra arguments, you must specify both!
@@ -989,7 +1171,7 @@ export class AccountsServer extends AccountsCommon {
       "services.password.enroll.reason": "enroll"
     };
 
-    expirePasswordToken(this, oldestValidDate, tokenFilter, userId);
+    await expirePasswordToken(this, oldestValidDate, tokenFilter, userId);
   }
 
   // Deletes expired tokens from the database and closes all open connections
@@ -999,7 +1181,14 @@ export class AccountsServer extends AccountsCommon {
   // tests. oldestValidDate is simulate expiring tokens without waiting
   // for them to actually expire. userId is used by tests to only expire
   // tokens for the test user.
-  _expireTokens(oldestValidDate, userId) {
+  /**
+   *
+   * @param oldestValidDate
+   * @param userId
+   * @private
+   * @return {Promise<void>}
+   */
+  async _expireTokens(oldestValidDate, userId) {
     const tokenLifetimeMs = this._getTokenLifetimeMs();
 
     // when calling from a test with extra arguments, you must specify both!
@@ -1014,7 +1203,7 @@ export class AccountsServer extends AccountsCommon {
 
     // Backwards compatible with older versions of meteor that stored login token
     // timestamps as numbers.
-    this.users.update({ ...userFilter,
+    await this.users.updateAsync({ ...userFilter,
       $or: [
         { "services.resume.loginTokens.when": { $lt: oldestValidDate } },
         { "services.resume.loginTokens.when": { $lt: +oldestValidDate } }
@@ -1034,13 +1223,13 @@ export class AccountsServer extends AccountsCommon {
   };
 
   // @override from accounts_common.js
-  config(options) {
+  config(...args) {
     // Call the overridden implementation of the method.
-    const superResult = AccountsCommon.prototype.config.apply(this, arguments);
+    const superResult = AccountsCommon.prototype.config.apply(this, args);
 
     // If the user set loginExpirationInDays to null, then we need to clear the
     // timer that periodically expires tokens.
-    if (hasOwn.call(this._options, 'loginExpirationInDays') &&
+    if (Object.hasOwn(this._options, 'loginExpirationInDays') &&
       this._options.loginExpirationInDays === null &&
       this.expireTokenInterval) {
       Meteor.clearInterval(this.expireTokenInterval);
@@ -1050,8 +1239,18 @@ export class AccountsServer extends AccountsCommon {
     return superResult;
   };
 
+  _onUsersCollectionChanged() {
+    if (this === Accounts) {
+      Meteor.users = this.users;
+    }
+    setupUsersCollection(this.users).catch(err => {
+      console.error('Failed to setup users collection:', err);
+    });
+    super._onUsersCollectionChanged();
+  }
+
   // Called by accounts-password
-  insertUserDoc(options, user) {
+  async insertUserDoc(options, user) {
     // - clone user document, to protect from modification
     // - add createdAt timestamp
     // - prepare an _id, so that you can modify other collections (eg
@@ -1078,7 +1277,8 @@ export class AccountsServer extends AccountsCommon {
 
     let fullUser;
     if (this._onCreateUserHook) {
-      fullUser = this._onCreateUserHook(options, user);
+      // Allows _onCreateUserHook to be a promise returning func
+      fullUser = await this._onCreateUserHook(options, user);
 
       // This is *not* part of the API. We need this because we can't isolate
       // the global server environment between tests, meaning we can't test
@@ -1089,14 +1289,14 @@ export class AccountsServer extends AccountsCommon {
       fullUser = defaultCreateUserHook(options, user);
     }
 
-    this._validateNewUserHooks.forEach(hook => {
-      if (! hook(fullUser))
+    for await (const hook of this._validateNewUserHooks) {
+      if (! await hook(fullUser))
         throw new Meteor.Error(403, "User validation failed");
-    });
+    }
 
     let userId;
     try {
-      userId = this.users.insert(fullUser);
+      userId = await this.users.insertAsync(fullUser);
     } catch (e) {
       // XXX string parsing sucks, maybe
       // https://jira.mongodb.org/browse/SERVER-3069 will get fixed one day
@@ -1126,9 +1326,9 @@ export class AccountsServer extends AccountsCommon {
   /// CLEAN UP FOR `logoutOtherClients`
   ///
 
-  _deleteSavedTokensForUser(userId, tokensToDelete) {
+  async _deleteSavedTokensForUser(userId, tokensToDelete) {
     if (tokensToDelete) {
-      this.users.update(userId, {
+      await this.users.updateAsync(userId, {
         $unset: {
           "services.resume.haveLoginTokensToDelete": 1,
           "services.resume.loginTokensToDelete": 1
@@ -1147,16 +1347,24 @@ export class AccountsServer extends AccountsCommon {
     // shouldn't happen very often. We shouldn't put a delay here because
     // that would give a lot of power to an attacker with a stolen login
     // token and the ability to crash the server.
-    Meteor.startup(() => {
-      this.users.find({
+    Meteor.startup(async () => {
+      const users = await this.users.find({
         "services.resume.haveLoginTokensToDelete": true
-      }, {fields: {
-        "services.resume.loginTokensToDelete": 1
-      }}).forEach(user => {
+      }, {
+        fields: {
+          "services.resume.loginTokensToDelete": 1
+        }
+      })
+      users.forEach(user => {
         this._deleteSavedTokensForUser(
           user._id,
           user.services.resume.loginTokensToDelete
-        );
+        )
+          // We don't need to wait for this to complete.
+          .then(_ => _)
+          .catch(err => {
+            console.log(err);
+          });
       });
     });
   };
@@ -1176,7 +1384,7 @@ export class AccountsServer extends AccountsCommon {
   // @returns {Object} Object with token and id keys, like the result
   //        of the "login" method.
   //
-  updateOrCreateUserFromExternalService(
+  async updateOrCreateUserFromExternalService(
     serviceName,
     serviceData,
     options
@@ -1188,7 +1396,7 @@ export class AccountsServer extends AccountsCommon {
         "Can't use updateOrCreateUserFromExternalService with internal service "
         + serviceName);
     }
-    if (!hasOwn.call(serviceData, 'id')) {
+    if (!Object.hasOwn(serviceData, 'id')) {
       throw new Error(
         `Service data for service ${serviceName} must include id`);
     }
@@ -1211,17 +1419,15 @@ export class AccountsServer extends AccountsCommon {
     } else {
       selector[serviceIdKey] = serviceData.id;
     }
-
-    let user = this.users.findOne(selector, {fields: this._options.defaultFieldSelector});
-
+    let user = await this.users.findOneAsync(selector, {fields: this._options.defaultFieldSelector});
     // Check to see if the developer has a custom way to find the user outside
     // of the general selectors above.
     if (!user && this._additionalFindUserOnExternalLogin) {
-      user = this._additionalFindUserOnExternalLogin({serviceName, serviceData, options})
+      user = await this._additionalFindUserOnExternalLogin({serviceName, serviceData, options})
     }
 
     // Before continuing, run user hook to see if we should continue
-    if (this._beforeExternalLoginHook && !this._beforeExternalLoginHook(serviceName, serviceData, user)) {
+    if (this._beforeExternalLoginHook && !(await this._beforeExternalLoginHook(serviceName, serviceData, user))) {
       throw new Meteor.Error(403, "Login forbidden");
     }
 
@@ -1233,11 +1439,11 @@ export class AccountsServer extends AccountsCommon {
     // needed.
     let opts = user ? {} : options;
     if (this._onExternalLoginHook) {
-      opts = this._onExternalLoginHook(options, user);
+      opts = await this._onExternalLoginHook(options, user);
     }
 
     if (user) {
-      pinEncryptedFieldsToUser(serviceData, user._id);
+      await pinEncryptedFieldsToUser(serviceData, user._id);
 
       let setAttrs = {};
       Object.keys(serviceData).forEach(key =>
@@ -1247,7 +1453,7 @@ export class AccountsServer extends AccountsCommon {
       // XXX Maybe we should re-use the selector above and notice if the update
       //     touches nothing?
       setAttrs = { ...setAttrs, ...opts };
-      this.users.update(user._id, {
+      await this.users.updateAsync(user._id, {
         $set: setAttrs
       });
 
@@ -1259,34 +1465,167 @@ export class AccountsServer extends AccountsCommon {
       // Create a new user with the service data.
       user = {services: {}};
       user.services[serviceName] = serviceData;
+      const userId = await this.insertUserDoc(opts, user);
       return {
         type: serviceName,
-        userId: this.insertUserDoc(opts, user)
+        userId
       };
     }
   };
 
-  // Removes default rate limiting rule
+  /**
+   * @summary Removes default rate limiting rule
+   * @locus Server
+   * @importFromPackage accounts-base
+   */
   removeDefaultRateLimit() {
     const resp = DDPRateLimiter.removeRule(this.defaultRateLimiterRuleId);
     this.defaultRateLimiterRuleId = null;
     return resp;
   };
 
-  // Add a default rule of limiting logins, creating new users and password reset
-  // to 5 times every 10 seconds per connection.
+  /**
+   * @summary Add a default rule of limiting logins, creating new users, requesting
+   * passwordless login tokens and password reset to 5 times every 10 seconds per connection.
+   * @locus Server
+   * @importFromPackage accounts-base
+   */
   addDefaultRateLimit() {
     if (!this.defaultRateLimiterRuleId) {
       this.defaultRateLimiterRuleId = DDPRateLimiter.addRule({
         userId: null,
         clientAddress: null,
         type: 'method',
-        name: name => ['login', 'createUser', 'resetPassword', 'forgotPassword']
+        name: name => ['login', 'createUser', 'resetPassword', 'forgotPassword',
+          'requestLoginTokenForUser']
           .includes(name),
         connectionId: (connectionId) => true,
       }, 5, 10000);
     }
   };
+
+  /**
+   * @summary Creates options for email sending for reset password and enroll account emails.
+   * You can use this function when customizing a reset password or enroll account email sending.
+   * @locus Server
+   * @param {Object} email Which address of the user's to send the email to.
+   * @param {Object} user The user object to generate options for.
+   * @param {String} url URL to which user is directed to confirm the email.
+   * @param {String} reason `resetPassword` or `enrollAccount`.
+   * @returns {Object} Options which can be passed to `Email.send`.
+   * @importFromPackage accounts-base
+   */
+  async generateOptionsForEmail(email, user, url, reason, extra = {}){
+    const options = {
+      to: email,
+      from: this.emailTemplates[reason].from
+        ? await this.emailTemplates[reason].from(user)
+        : this.emailTemplates.from,
+      subject: await this.emailTemplates[reason].subject(user, url, extra),
+    };
+
+    if (typeof this.emailTemplates[reason].text === 'function') {
+      options.text = await this.emailTemplates[reason].text(user, url, extra);
+    }
+
+    if (typeof this.emailTemplates[reason].html === 'function') {
+      options.html = await this.emailTemplates[reason].html(user, url, extra);
+    }
+
+    if (typeof this.emailTemplates.headers === 'object') {
+      options.headers = this.emailTemplates.headers;
+    }
+
+    return options;
+  };
+
+  async _checkForCaseInsensitiveDuplicates(
+    fieldName,
+    displayName,
+    fieldValue,
+    ownUserId
+  ) {
+    // Some tests need the ability to add users with the same case insensitive
+    // value, hence the _skipCaseInsensitiveChecksForTest check
+    const skipCheck = Object.hasOwn(
+      this._skipCaseInsensitiveChecksForTest,
+      fieldValue
+    );
+
+    if (fieldValue && !skipCheck) {
+      const matchedUsers = await Meteor.users
+        .find(
+          this._selectorForFastCaseInsensitiveLookup(fieldName, fieldValue),
+          {
+            fields: { _id: 1 },
+            // we only need a maximum of 2 users for the logic below to work
+            limit: 2,
+          }
+        )
+        .fetchAsync();
+
+      if (
+        matchedUsers.length > 0 &&
+        // If we don't have a userId yet, any match we find is a duplicate
+        (!ownUserId ||
+          // Otherwise, check to see if there are multiple matches or a match
+          // that is not us
+          matchedUsers.length > 1 || matchedUsers[0]._id !== ownUserId)
+      ) {
+        this._handleError(`${displayName} already exists.`);
+      }
+    }
+  };
+
+  async _createUserCheckingDuplicates({ user, email, username, options }) {
+    const newUser = {
+      ...user,
+      ...(username ? { username } : {}),
+      ...(email ? { emails: [{ address: email, verified: false }] } : {}),
+    };
+
+    // Perform a case insensitive check before insert
+    await this._checkForCaseInsensitiveDuplicates('username', 'Username', username);
+    await this._checkForCaseInsensitiveDuplicates('emails.address', 'Email', email);
+
+    const userId = await this.insertUserDoc(options, newUser);
+    // Perform another check after insert, in case a matching user has been
+    // inserted in the meantime
+    try {
+      await this._checkForCaseInsensitiveDuplicates('username', 'Username', username, userId);
+      await this._checkForCaseInsensitiveDuplicates('emails.address', 'Email', email, userId);
+    } catch (ex) {
+      // Remove inserted user if the check fails
+      await Meteor.users.removeAsync(userId);
+      throw ex;
+    }
+    return userId;
+  }
+
+  _handleError = (msg, throwError = true, errorCode = 403) => {
+    const isErrorAmbiguous = this._options.ambiguousErrorMessages ?? true;
+    const error = new Meteor.Error(
+      errorCode,
+      isErrorAmbiguous
+        ? 'Something went wrong. Please check your credentials.'
+        : msg
+    );
+    if (throwError) {
+      throw error;
+    }
+    return error;
+  }
+
+  _userQueryValidator = Match.Where(user => {
+    check(user, {
+      id: Match.Optional(Match.NonEmptyString),
+      username: Match.Optional(Match.NonEmptyString),
+      email: Match.Optional(Match.NonEmptyString)
+    });
+    if (Object.keys(user).length !== 1)
+      throw new Match.Error("User property must have exactly one field");
+    return true;
+  });
 
 }
 
@@ -1299,10 +1638,10 @@ const cloneAttemptWithConnection = (connection, attempt) => {
   return clonedAttempt;
 };
 
-const tryLoginMethod = (type, fn) => {
+const tryLoginMethod = async (type, fn) => {
   let result;
   try {
-    result = fn();
+    result = await fn();
   }
   catch (e) {
     result = {error: e};
@@ -1321,7 +1660,7 @@ const setupDefaultLoginHandlers = accounts => {
 };
 
 // Login handler for resume tokens.
-const defaultResumeLoginHandler = (accounts, options) => {
+const defaultResumeLoginHandler = async (accounts, options) => {
   if (!options.resume)
     return undefined;
 
@@ -1332,7 +1671,7 @@ const defaultResumeLoginHandler = (accounts, options) => {
   // First look for just the new-style hashed login token, to avoid
   // sending the unhashed token to the database in a query if we don't
   // need to.
-  let user = accounts.users.findOne(
+  let user = await accounts.users.findOneAsync(
     {"services.resume.loginTokens.hashedToken": hashedToken},
     {fields: {"services.resume.loginTokens.$": 1}});
 
@@ -1342,14 +1681,14 @@ const defaultResumeLoginHandler = (accounts, options) => {
     // the old-style token OR the new-style token, because another
     // client connection logging in simultaneously might have already
     // converted the token.
-    user = accounts.users.findOne({
-      $or: [
-        {"services.resume.loginTokens.hashedToken": hashedToken},
-        {"services.resume.loginTokens.token": options.resume}
-      ]
-    },
-    // Note: Cannot use ...loginTokens.$ positional operator with $or query.
-    {fields: {"services.resume.loginTokens": 1}});
+    user =  await accounts.users.findOneAsync({
+        $or: [
+          {"services.resume.loginTokens.hashedToken": hashedToken},
+          {"services.resume.loginTokens.token": options.resume}
+        ]
+      },
+      // Note: Cannot use ...loginTokens.$ positional operator with $or query.
+      {fields: {"services.resume.loginTokens": 1}});
   }
 
   if (! user)
@@ -1387,7 +1726,7 @@ const defaultResumeLoginHandler = (accounts, options) => {
     // after we read it).  Using $addToSet avoids getting an index
     // error if another client logging in simultaneously has already
     // inserted the new hashed token.
-    accounts.users.update(
+    await accounts.users.updateAsync(
       {
         _id: user._id,
         "services.resume.loginTokens.token": options.resume
@@ -1403,7 +1742,7 @@ const defaultResumeLoginHandler = (accounts, options) => {
     // Remove the old token *after* adding the new, since otherwise
     // another client trying to login between our removing the old and
     // adding the new wouldn't find a token to login with.
-    accounts.users.update(user._id, {
+    await accounts.users.updateAsync(user._id, {
       $pull: {
         "services.resume.loginTokens": { "token": options.resume }
       }
@@ -1419,69 +1758,60 @@ const defaultResumeLoginHandler = (accounts, options) => {
   };
 };
 
-const expirePasswordToken = (
-  accounts,
-  oldestValidDate,
-  tokenFilter,
-  userId
-) => {
-  // boolean value used to determine if this method was called from enroll account workflow
-  let isEnroll = false;
-  const userFilter = userId ? {_id: userId} : {};
-  // check if this method was called from enroll account workflow
-  if(tokenFilter['services.password.enroll.reason']) {
-    isEnroll = true;
-  }
-  let resetRangeOr = {
-    $or: [
-      { "services.password.reset.when": { $lt: oldestValidDate } },
-      { "services.password.reset.when": { $lt: +oldestValidDate } }
-    ]
-  };
-  if(isEnroll) {
-    resetRangeOr = {
+const expirePasswordToken =
+  async (
+    accounts,
+    oldestValidDate,
+    tokenFilter,
+    userId
+  ) => {
+    // boolean value used to determine if this method was called from enroll account workflow
+    let isEnroll = false;
+    const userFilter = userId ? { _id: userId } : {};
+    // check if this method was called from enroll account workflow
+    if (tokenFilter['services.password.enroll.reason']) {
+      isEnroll = true;
+    }
+    let resetRangeOr = {
       $or: [
-        { "services.password.enroll.when": { $lt: oldestValidDate } },
-        { "services.password.enroll.when": { $lt: +oldestValidDate } }
+        { "services.password.reset.when": { $lt: oldestValidDate } },
+        { "services.password.reset.when": { $lt: +oldestValidDate } }
       ]
     };
-  }
-  const expireFilter = { $and: [tokenFilter, resetRangeOr] };
-  if(isEnroll) {
-    accounts.users.update({...userFilter, ...expireFilter}, {
-      $unset: {
-        "services.password.enroll": ""
-      }
-    }, { multi: true });
-  } else {
-    accounts.users.update({...userFilter, ...expireFilter}, {
-      $unset: {
-        "services.password.reset": ""
-      }
-    }, { multi: true });
-  }
+    if (isEnroll) {
+      resetRangeOr = {
+        $or: [
+          { "services.password.enroll.when": { $lt: oldestValidDate } },
+          { "services.password.enroll.when": { $lt: +oldestValidDate } }
+        ]
+      };
+    }
+    const expireFilter = { $and: [tokenFilter, resetRangeOr] };
+    if (isEnroll) {
+      await accounts.users.updateAsync({ ...userFilter, ...expireFilter }, {
+        $unset: {
+          "services.password.enroll": ""
+        }
+      }, { multi: true });
+    } else {
+      await accounts.users.updateAsync({ ...userFilter, ...expireFilter }, {
+        $unset: {
+          "services.password.reset": ""
+        }
+      }, { multi: true });
+    }
 
-};
+  };
 
 const setExpireTokensInterval = accounts => {
-  accounts.expireTokenInterval = Meteor.setInterval(() => {
-    accounts._expireTokens();
-    accounts._expirePasswordResetTokens();
-    accounts._expirePasswordEnrollTokens();
+  accounts.expireTokenInterval = Meteor.setInterval(async () => {
+   await accounts._expireTokens();
+   await accounts._expirePasswordResetTokens();
+   await accounts._expirePasswordEnrollTokens();
   }, EXPIRE_TOKENS_INTERVAL_MS);
 };
 
-///
-/// OAuth Encryption Support
-///
-
-const OAuthEncryption =
-  Package["oauth-encryption"] &&
-  Package["oauth-encryption"].OAuthEncryption;
-
-const usingOAuthEncryption = () => {
-  return OAuthEncryption && OAuthEncryption.keyIsLoaded();
-};
+const OAuthEncryption = Package["oauth-encryption"]?.OAuthEncryption;
 
 // OAuth service data is temporarily stored in the pending credentials
 // collection during the oauth authentication process.  Sensitive data
@@ -1493,43 +1823,11 @@ const usingOAuthEncryption = () => {
 const pinEncryptedFieldsToUser = (serviceData, userId) => {
   Object.keys(serviceData).forEach(key => {
     let value = serviceData[key];
-    if (OAuthEncryption && OAuthEncryption.isSealed(value))
+    if (OAuthEncryption?.isSealed(value))
       value = OAuthEncryption.seal(OAuthEncryption.open(value), userId);
     serviceData[key] = value;
   });
 };
-
-
-// Encrypt unencrypted login service secrets when oauth-encryption is
-// added.
-//
-// XXX For the oauthSecretKey to be available here at startup, the
-// developer must call Accounts.config({oauthSecretKey: ...}) at load
-// time, instead of in a Meteor.startup block, because the startup
-// block in the app code will run after this accounts-base startup
-// block.  Perhaps we need a post-startup callback?
-
-Meteor.startup(() => {
-  if (! usingOAuthEncryption()) {
-    return;
-  }
-
-  const { ServiceConfiguration } = Package['service-configuration'];
-
-  ServiceConfiguration.configurations.find({
-    $and: [{
-      secret: { $exists: true }
-    }, {
-      "secret.algorithm": { $exists: false }
-    }]
-  }).forEach(config => {
-    ServiceConfiguration.configurations.update(config._id, {
-      $set: {
-        secret: OAuthEncryption.seal(config.secret)
-      }
-    });
-  });
-});
 
 // XXX see comment on Accounts.createUser in passwords_server about adding a
 // second "server options" argument.
@@ -1546,20 +1844,23 @@ function defaultValidateNewUserHook(user) {
     return true;
   }
 
-  let emailIsGood = false;
-  if (user.emails && user.emails.length > 0) {
-    emailIsGood = user.emails.reduce(
-      (prev, email) => prev || this._testEmailDomain(email.address), false
-    );
-  } else if (user.services && Object.values(user.services).length > 0) {
-    // Find any email of any service and check it
-    emailIsGood = Object.values(user.services).reduce(
-      (prev, service) => service.email && this._testEmailDomain(service.email),
-      false,
-    );
+  const hasValidEmail = (user) => {
+    // Option A: user-provided emails
+    if (user.emails?.length) {
+      return user.emails.some(email => this._testEmailDomain(email.address));
+    }
+
+    // Option B: any connected service email
+    if (user.services) {
+      return Object.values(user.services).some(
+        service => service?.email && this._testEmailDomain(service.email)
+      );
+    }
+
+    return false;
   }
 
-  if (emailIsGood) {
+  if (hasValidEmail(user)) {
     return true;
   }
 
@@ -1570,11 +1871,14 @@ function defaultValidateNewUserHook(user) {
   }
 }
 
-const setupUsersCollection = users => {
+const setupUsersCollection = async users => {
   ///
   /// RESTRICTING WRITES TO USER OBJECTS
   ///
-  users.allow({
+  // Collections created with `defineMutationMethods: false` have no
+  // allow/deny validators (and no client mutation methods to protect);
+  // don't let allow() throw and skip every index below.
+  if (users._validators) users.allow({
     // clients can modify the profile field of their own document, and
     // nothing else.
     update: (userId, user, fields, modifier) => {
@@ -1596,19 +1900,39 @@ const setupUsersCollection = users => {
   });
 
   /// DEFAULT INDEXES ON USERS
-  users.createIndex('username', { unique: true, sparse: true });
-  users.createIndex('emails.address', { unique: true, sparse: true });
-  users.createIndex('services.resume.loginTokens.hashedToken',
+  await users.createIndexAsync('username', { unique: true, sparse: true });
+  await users.createIndexAsync('emails.address', { unique: true, sparse: true });
+  await users.createIndexAsync('services.resume.loginTokens.hashedToken',
     { unique: true, sparse: true });
-  users.createIndex('services.resume.loginTokens.token',
+  await users.createIndexAsync('services.resume.loginTokens.token',
     { unique: true, sparse: true });
   // For taking care of logoutOtherClients calls that crashed before the
   // tokens were deleted.
-  users.createIndex('services.resume.haveLoginTokensToDelete',
+  await users.createIndexAsync('services.resume.haveLoginTokensToDelete',
     { sparse: true });
   // For expiring login tokens
-  users.createIndex("services.resume.loginTokens.when", { sparse: true });
+  await users.createIndexAsync("services.resume.loginTokens.when", { sparse: true });
   // For expiring password tokens
-  users.createIndex('services.password.reset.when', { sparse: true });
-  users.createIndex('services.password.enroll.when', { sparse: true });
+  await users.createIndexAsync('services.password.reset.when', { sparse: true });
+  await users.createIndexAsync('services.password.enroll.when', { sparse: true });
 };
+
+
+// Generates permutations of all case variations of a given string.
+const generateCasePermutationsForString = string => {
+  let permutations = [''];
+  for (let i = 0; i < string.length; i++) {
+    const ch = string.charAt(i);
+    permutations = [].concat(...(permutations.map(prefix => {
+      const lowerCaseChar = ch.toLowerCase();
+      const upperCaseChar = ch.toUpperCase();
+      // Don't add unnecessary permutations when ch is not a letter
+      if (lowerCaseChar === upperCaseChar) {
+        return [prefix + ch];
+      } else {
+        return [prefix + lowerCaseChar, prefix + upperCaseChar];
+      }
+    })));
+  }
+  return permutations;
+}

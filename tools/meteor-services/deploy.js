@@ -20,7 +20,6 @@ import {
   doInteractivePasswordLogin,
   loggedInUsername,
   isLoggedIn,
-  maybePrintRegistrationLink,
 } from './auth.js';
 import { recordPackages } from './stats.js';
 import { Console } from '../console/console.js';
@@ -83,7 +82,7 @@ const CAPABILITIES = ['showDeployMessages', 'canTransferAuthorization'];
 //   derived from either a transport-level exception, the response
 //   body, or a generic 'try again later' message, as appropriate
 
-function deployRpc(options) {
+async function deployRpc(options) {
   options = Object.assign({}, options);
   options.headers = Object.assign({}, options.headers || {});
   if (options.headers.cookie) {
@@ -101,7 +100,15 @@ function deployRpc(options) {
     options.qs.capabilities.push('willPollVersionStatus');
   }
 
-  const deployURLBase = getDeployURL(options.site).await();
+  let deployURLBase;
+  try {
+    deployURLBase = await getDeployURL(options.site);
+  } catch (e) {
+    return {
+      statusCode: null,
+      errorMessage: e.message
+    };
+  }
 
   if (options.printDeployURL) {
     Console.info("Talking to Galaxy servers at " + deployURLBase);
@@ -116,7 +123,7 @@ function deployRpc(options) {
 
   // XXX: Reintroduce progress for upload
   try {
-    var result = request(Object.assign(options, {
+    var result = await request(Object.assign(options, {
       url: deployURLBase + '/' + options.operation +
         operand,
       method: options.method || 'GET',
@@ -194,13 +201,13 @@ function deployRpc(options) {
 //   accounts server but our authentication actually fails, then prompt
 //   the user to log in with a username and password and then resend the
 //   RPC.
-function authedRpc(options) {
+async function authedRpc(options) {
   var rpcOptions = Object.assign({}, options);
   var preflight = rpcOptions.preflight;
   delete rpcOptions.preflight;
 
   // Fetch auth info
-  var infoResult = deployRpc({
+  var infoResult = await deployRpc({
     operation: 'info',
     site: rpcOptions.site,
     expectPayload: [],
@@ -222,7 +229,7 @@ function authedRpc(options) {
 
     // Our authentication didn't validate, so prompt the user to log in
     // again, and resend the RPC if the login succeeds.
-    var username = Console.readLine({
+    var username = await Console.readLine({
       prompt: "Username: ",
       stream: process.stderr
     });
@@ -230,8 +237,8 @@ function authedRpc(options) {
       username: username,
       suppressErrorMessage: true
     };
-    if (doInteractivePasswordLogin(loginOptions)) {
-      return authedRpc(options);
+    if (await doInteractivePasswordLogin(loginOptions)) {
+      return await authedRpc(options);
     } else {
       return {
         statusCode: 403,
@@ -242,7 +249,7 @@ function authedRpc(options) {
 
   if (infoResult.statusCode === 404) {
     // Doesn't exist, therefore not protected.
-    return preflight ? { } : deployRpc(rpcOptions);
+    return preflight ? { } : await deployRpc(rpcOptions);
   }
 
   if (infoResult.errorMessage) {
@@ -254,7 +261,7 @@ function authedRpc(options) {
     // Not protected.
     //
     // XXX should prompt the user to claim the app (only if deploying?)
-    return preflight ? { } : deployRpc(rpcOptions);
+    return preflight ? { } : await deployRpc(rpcOptions);
   }
 
   if (info.protection === "account") {
@@ -282,7 +289,7 @@ function authedRpc(options) {
         authorized: info.authorized
       };
     } else {
-      return deployRpc(rpcOptions);
+      return await deployRpc(rpcOptions);
     }
   }
 
@@ -334,16 +341,19 @@ function canonicalizeSite(site) {
     url = 'http://' + url;
   }
 
-  var parsed = require('url').parse(url);
+  let parsed = null;
+  try {
+    parsed = new URL(url);
+  } catch (e) {}
 
-  if (! parsed.hostname) {
+  if (! parsed || ! parsed.hostname) {
     Console.info(
       "Please specify a domain to connect to, such as www.example.com or " +
       "http://www.example.com/");
     return false;
   }
 
-  if (parsed.pathname != '/' || parsed.hash || parsed.query) {
+  if (parsed.pathname !== '/' || parsed.hash || parsed.search) {
     Console.info(
       "Sorry, Meteor does not yet support specific path URLs, such as " +
       Console.url("http://www.example.com/blog") + " .  Please specify the root of a domain.");
@@ -410,7 +420,7 @@ async function pollForDeploy(pollingState, versionId, site, deployWithTokenProps
   } = pollingState;
 
   // Do a call to the version-status endpoint for the specified versionId
-  const versionStatusResult = deployRpc({
+  const versionStatusResult = await deployRpc({
     method: 'GET',
     operation: 'version-status',
     site,
@@ -489,7 +499,7 @@ export async function bundleAndDeploy(options) {
   let preflightPassword = null;
 
   if (options.isBuildOnly) {
-    Console.info('Skipping pre authentication as the option --build-only was provded.');
+    Console.info('Skipping pre authentication as the option --build-only was provided.');
   } else {
     site = options.site && canonicalizeSite(options.site)
     if (! site) {
@@ -510,14 +520,14 @@ export async function bundleAndDeploy(options) {
     // they'll get an email prompt instead of a username prompt because
     // the command-line tool didn't have time to learn about their
     // username before the credential was expired.
-    pollForRegistrationCompletion({
+    await pollForRegistrationCompletion({
       noLogout: true
     });
     const promptIfAuthFails = (loggedInUsername() !== null);
 
     // Check auth up front, rather than after the (potentially lengthy)
     // bundling process.
-    const preflight = authedRpc({
+    const preflight = await authedRpc({
       site: site,
       preflight: true,
       promptIfAuthFails: promptIfAuthFails,
@@ -547,7 +557,7 @@ export async function bundleAndDeploy(options) {
   }
 
   const projectDir = options.projectContext.getProjectLocalDirectory('');
-  const gitCommitHash = process.env.METEOR_GIT_COMMIT_HASH || findGitCommitHash(projectDir);
+  const gitCommitHash = process.env.METEOR_GIT_COMMIT_HASH || await findGitCommitHash(projectDir);
 
   const buildCache = options.projectContext.getBuildCache();
   let isCacheBuildValid = options.isCacheBuildEnabled;
@@ -581,7 +591,7 @@ export async function bundleAndDeploy(options) {
 
   if (options.isCacheBuildEnabled) {
     Console.info('Saving build in cache (--cache-build)...');
-    options.projectContext.saveBuildCache({
+    await options.projectContext.saveBuildCache({
       buildDir,
       bundlePath,
       gitCommitHash
@@ -591,10 +601,10 @@ export async function bundleAndDeploy(options) {
   Console.info('Preparing to build your app...');
 
   var settings = null;
-  var messages = buildmessage.capture({
+  var messages = await buildmessage.capture({
     title: "preparing to deploy",
     rootPath: process.cwd()
-  }, function () {
+  }, async function () {
     if (options.settingsFile) {
       settings = getSettings(options.settingsFile);
     }
@@ -607,7 +617,7 @@ export async function bundleAndDeploy(options) {
     } else {
       const bundler = require('../isobuild/bundler.js');
 
-      const bundleResult = bundler.bundle({
+      const bundleResult = await bundler.bundle({
         projectContext: options.projectContext,
         outputPath: bundlePath,
         buildOptions: options.buildOptions,
@@ -626,7 +636,7 @@ export async function bundleAndDeploy(options) {
   }
 
   if (options.recordPackageUsage) {
-    recordPackages({
+    await recordPackages({
       what: "sdk.deploy",
       projectContext: options.projectContext,
       site: site
@@ -646,10 +656,10 @@ export async function bundleAndDeploy(options) {
   };
 
   Console.info('Preparing to upload your app...');
-  const result = buildmessage.enterJob({
+  const result = await buildmessage.enterJob({
     title: "uploading"
-  }, Profile("upload bundle", function () {
-    return authedRpc({
+  }, Profile("upload bundle", async function () {
+    return await authedRpc({
       method: 'POST',
       operation: 'deploy',
       site: site,
@@ -702,13 +712,13 @@ export async function bundleAndDeploy(options) {
   return 0;
 };
 
-export function deleteApp(site) {
+export async function deleteApp(site) {
   site = canonicalizeSite(site);
   if (! site) {
     return 1;
   }
 
-  var result = authedRpc({
+  var result = await authedRpc({
     method: 'DELETE',
     operation: 'deploy',
     site: site,
@@ -733,8 +743,8 @@ export function deleteApp(site) {
 // messages.  Returns the result of the RPC if successful, or null
 // otherwise (including if auth failed or if the user is not authorized
 // for this site).
-function checkAuthThenSendRpc(site, operation, what) {
-  var preflight = authedRpc({
+async function checkAuthThenSendRpc(site, operation, what) {
+  var preflight = await authedRpc({
     operation: operation,
     site: site,
     preflight: true,
@@ -752,7 +762,7 @@ function checkAuthThenSendRpc(site, operation, what) {
     if (! isLoggedIn()) {
       // Maybe the user is authorized for this app but not logged in
       // yet, so give them a login prompt.
-      var loginResult = doUsernamePasswordLogin({ retry: true });
+      var loginResult = await doUsernamePasswordLogin({ retry: true });
       if (loginResult) {
         // Once we've logged in, retry the whole operation. We need to
         // do the preflight request again instead of immediately moving
@@ -760,7 +770,7 @@ function checkAuthThenSendRpc(site, operation, what) {
         // logged-in user is authorized for this app, and if they
         // aren't, then we want to print the nice unauthorized error
         // message.
-        return checkAuthThenSendRpc(site, operation, what);
+        return await checkAuthThenSendRpc(site, operation, what);
       } else {
         // Shouldn't ever get here because we set the retry flag on the
         // login, but just in case.
@@ -782,7 +792,7 @@ function checkAuthThenSendRpc(site, operation, what) {
 
   // User is authorized for the app; go ahead and do the actual RPC.
 
-  var result = authedRpc({
+  var result = await authedRpc({
     operation: operation,
     site: site,
     expectMessage: true,
@@ -800,14 +810,14 @@ function checkAuthThenSendRpc(site, operation, what) {
 // On failure, prints a message to stderr and returns null. Otherwise,
 // returns a temporary authenticated Mongo URL allowing access to this
 // site's database.
-export function temporaryMongoUrl(site) {
+export async function temporaryMongoUrl(site) {
   site = canonicalizeSite(site);
   if (! site) {
     // canonicalizeSite printed an error
     return null;
   }
 
-  var result = checkAuthThenSendRpc(site, 'mongo', 'open a mongo connection');
+  var result = await checkAuthThenSendRpc(site, 'mongo', 'open a mongo connection');
 
   if (result !== null) {
     return result.message;
@@ -816,13 +826,13 @@ export function temporaryMongoUrl(site) {
   }
 };
 
-export function listAuthorized(site) {
+export async function listAuthorized(site) {
   site = canonicalizeSite(site);
   if (! site) {
     return 1;
   }
 
-  var result = deployRpc({
+  var result = await deployRpc({
     operation: 'info',
     site: site,
     expectPayload: [],
@@ -860,14 +870,14 @@ export function listAuthorized(site) {
 };
 
 // action is "add", "transfer" or "remove"
-export function changeAuthorized(site, action, username) {
+export async function changeAuthorized(site, action, username) {
   site = canonicalizeSite(site);
   if (! site) {
     // canonicalizeSite will have already printed an error
     return 1;
   }
 
-  var result = authedRpc({
+  var result = await authedRpc({
     method: 'POST',
     operation: 'authorized',
     site: site,
@@ -890,8 +900,8 @@ export function changeAuthorized(site, action, username) {
   return 0;
 };
 
-export function listSites() {
-  var result = deployRpc({
+export async function listSites() {
+  var result = await deployRpc({
     method: "GET",
     operation: "authorized-apps",
     promptIfAuthFails: true,
@@ -927,23 +937,44 @@ function addScheme(hostOrURL) {
   }
 };
 
-// Maps from "site" to Promise<deploy URL>, so we don't have to re-ping on each
-// RPC (even if the calls to getDeployURL overlap).
+// Discovery may select only Galaxy hosts: deploy RPCs carry the account token.
+const DEFAULT_DEPLOY_URL = "https://us-east-1.galaxy-deploy.meteor.com";
+const GALAXY_DEPLOY_DOMAIN = "galaxy-deploy.meteor.com";
+
+export function trustedGalaxyDeployURL(deployURL) {
+  if (typeof deployURL !== "string") {
+    return null;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(deployURL);
+  } catch (e) {
+    return null;
+  }
+
+  if (parsed.protocol !== "https:" ||
+      parsed.username || parsed.password || parsed.port ||
+      ! (parsed.hostname === GALAXY_DEPLOY_DOMAIN ||
+         parsed.hostname.endsWith("." + GALAXY_DEPLOY_DOMAIN))) {
+    return null;
+  }
+
+  return parsed.origin + (parsed.pathname === "/" ? "" : parsed.pathname);
+}
+
 const galaxyDiscoveryCache = new Map;
 
-// getDeployURL returns the a Promise for the base deploy URL for the given app.
 // "app" may be falsey for certain RPCs (eg meteor list-sites).
-function getDeployURL(site) {
+async function getDeployURL(site) {
   // Always trust explicitly configuration via env.
   if (process.env.DEPLOY_HOSTNAME) {
     return Promise.resolve(addScheme(process.env.DEPLOY_HOSTNAME.trim()));
   }
 
-  const defaultURL = "https://us-east-1.galaxy-deploy.meteor.com";
-
   // No site? Just use the default.
   if (!site) {
-    return Promise.resolve(defaultURL);
+    return Promise.resolve(DEFAULT_DEPLOY_URL);
   }
 
   // If we have a site, we can try to do Galaxy discovery.
@@ -953,22 +984,39 @@ function getDeployURL(site) {
     return galaxyDiscoveryCache.get(site);
   }
 
-  // Otherwise, try https first, then http, then just use the default.
-  const p = discoverGalaxy(site, "https")
-          .catch(() => discoverGalaxy(site, "http"))
-          .catch(() => defaultURL);
-  galaxyDiscoveryCache.set(site, p);
-  return p;
+  // Otherwise, try https, then http, then just use the default. Galaxy only
+  // answers over http for sites without a certificate yet, such as a new
+  // app's first deploy outside us-east-1. Whoever answers discovery chooses
+  // where the account token goes, so either answer must name a Galaxy deploy
+  // server below.
+  let discoveredURL;
+  try {
+    discoveredURL = await discoverGalaxy(site, "https")
+      .catch(() => discoverGalaxy(site, "http"));
+  } catch (e) {
+    galaxyDiscoveryCache.set(site, DEFAULT_DEPLOY_URL);
+    return DEFAULT_DEPLOY_URL;
+  }
+
+  const deployURL = trustedGalaxyDeployURL(discoveredURL);
+  if (! deployURL) {
+    throw new Error(
+      "Galaxy discovery for " + site + " returned " +
+      JSON.stringify(discoveredURL) + ", which is not a Galaxy deploy " +
+      "server (https://*." + GALAXY_DEPLOY_DOMAIN + "). Refusing to send your Meteor credentials there. If " +
+      "you trust this server, set the DEPLOY_HOSTNAME environment variable " +
+      "to it.");
+  }
+
+  galaxyDiscoveryCache.set(site, deployURL);
+  return deployURL;
 }
 
-// discoverGalaxy returns the URL to use for Galaxy discovery, or an error if it
-// couldn't be fetched.
 async function discoverGalaxy(site, scheme) {
-  const discoveryURL =
-          scheme + "://" + site + "/.well-known/meteor/deploy-url";
+  const discoveryURL = scheme + "://" + site + "/.well-known/meteor/deploy-url";
   // If httpHelpers.request throws, the returned Promise will reject, which is
   // fine.
-  const { response, body } = request({
+  const { response, body } = await request({
     url: discoveryURL,
     json: true,
     strictSSL: true,

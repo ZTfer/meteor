@@ -1,53 +1,139 @@
 import sourcemap from "source-map";
 import { createHash } from "crypto";
-import LRU from "lru-cache";
+import LRUCache from "lru-cache";
+import { loadPostCss, watchAndHashDeps, usePostCss } from './postcss.js';
+import { Log } from 'meteor/logging';
+
+const { argv, env:{ DEBUG_CSS } } = process;
+const verbose = (DEBUG_CSS!=="false" && DEBUG_CSS!=="0" && (
+  DEBUG_CSS || argv.indexOf('--verbose') > -1 || argv.indexOf('--debug') > -1
+));
 
 Plugin.registerMinifier({
   extensions: ["css"],
-  archMatching: "web"
+  archMatching: "web",
 }, function () {
   const minifier = new CssToolsMinifier();
   return minifier;
 });
 
 class CssToolsMinifier {
+  constructor() {
+    this.cache = new LRUCache({
+      max: 100,
+    });
 
-  async processFilesForBundle (files, options) {
-    const mode = options.minifyMode;
-  
-    if (! files.length) return;
-  
-    const merged = await mergeCss(files);
-
-    if (mode === 'development') {
-      files[0].addStylesheet({
-    	data: merged.code,
-      	sourceMap: merged.sourceMap,
-      	path: 'merged-stylesheets.css'
-      });
-      return;
-    }
-  
-    const minifiedFiles = CssTools.minifyCss(merged.code);
-  
-    if (files.length) {
-      minifiedFiles.forEach(function (minified) {
-        files[0].addStylesheet({
-          data: minified
-        });
-      });
-    }
+    this.depsHashCache = Object.create(null);
+    this.totalSize = 0;
+    this.totalMinifiedSize = 0;
+    this.haveHitAnyCache = false; // once we hit the cache, there's no point in showing 'Adding CSS', we know it will be fine and floods the terminal needlessly.
   }
 
+  beforeMinify() {
+    this.depsHashCache = Object.create(null);
+  }
+
+  formatSize(bytes) {
+    return bytes < 1024 ? `${bytes} bytes` : `${Math.round(bytes/1024)}k`;
+  }
+
+  watchAndHashDeps(deps, file) {
+    const cacheKey = JSON.stringify(deps);
+
+    if (cacheKey in this.depsHashCache) {
+      return this.depsHashCache[cacheKey];
+    }
+
+    let hash = watchAndHashDeps(deps, (filePath) => {
+      return file.readAndWatchFileWithHash(filePath).hash;
+    });
+    this.depsHashCache[cacheKey] = hash;
+
+    return hash;
+  }
+
+  async minifyFiles (files, mode, postcssConfig) {
+    const cacheKey = createCacheKey(files, mode);
+    const cachedResult = this.cache.get(cacheKey);
+
+    if (
+      cachedResult &&
+      cachedResult.depsCacheKey === this.watchAndHashDeps(cachedResult.deps, files[0])
+    ) {
+      if (verbose && !this.haveHitAnyCache) {
+        this.haveHitAnyCache = true;
+        setTimeout( () => { // we use a timeout to give all files a chance to finish being minified
+          const stats = [`minifyStdCSS: Total CSS ${this.formatSize(this.totalSize)}`];
+          if (this.totalMinifiedSize!==0) {
+            stats.push(`minified ${this.formatSize(this.totalMinifiedSize)}`);
+            stats.push(`reduction ${Math.round(100-this.totalMinifiedSize*100/this.totalSize)}%`);
+          }
+          console.log(stats.join(", "));
+        }, 500);
+      }
+      return cachedResult.stylesheets;
+    }
+
+    let result = [];
+    if (verbose) process.stdout.write(` > Merging [ ${files.map( ({ _source:{ targetPath } }) => targetPath ).join(' ')} ]`);
+    const merged = await mergeCss(files, postcssConfig);
+    if (verbose) {
+      process.stdout.write(` > ${this.formatSize(merged.code.length)}`);
+      this.totalSize += merged.code.length;
+    }
+
+    if (mode === 'development') {
+      result = [{
+        data: merged.code,
+        sourceMap: merged.sourceMap,
+        path: 'merged-stylesheets.css',
+      }];
+    } else {
+      if (verbose) process.stdout.write(` > minifying`);
+
+      const minifiedFiles = await CssTools.minifyCssAsync(merged.code);
+      result = minifiedFiles.map( minified => ({ data:minified }) );
+
+      if (verbose) {
+        const minifiedSize = minifiedFiles.reduce( (sum, minifiedFile) => sum + minifiedFile.length, 0);
+        process.stdout.write(` > ${this.formatSize(minifiedSize)}`);
+        this.totalMinifiedSize += minifiedSize;
+      }
+    }
+
+    if (verbose) process.stdout.write('\n');
+
+    this.cache.set(cacheKey, {
+      stylesheets: result,
+      deps: merged.deps,
+      depsCacheKey: this.watchAndHashDeps(merged.deps, files[0]),
+    });
+    return result;
+  }
+
+  async processFilesForBundle(files, { minifyMode }) {
+    if (! files.length) return;
+
+    const { error, postcssConfig } = await loadPostCss();
+
+    if (error) {
+      if (verbose) Log.error('processFilesForBundle loadPostCss error', error);
+      files[0].error(error);
+      return;
+    }
+
+    const stylesheets = await this.minifyFiles(files, minifyMode, postcssConfig);
+
+    stylesheets.forEach( (stylesheet,i) => {
+      if (verbose && !this.haveHitAnyCache) process.stdout.write(`Adding CSS${i===0?'':' '+i+1}`);
+      files[0].addStylesheet(stylesheet);
+    });
+  }
 }
 
-
-const mergeCache = new LRU({
-  max: 100
-});
-
-const hashFiles = Profile("hashFiles", function (files) {
+const createCacheKey = Profile("createCacheKey", function (files, minifyMode) {
   const hash = createHash("sha1");
+  hash.update(minifyMode).update("\0");
   files.forEach(f => {
     hash.update(f.getSourceHash()).update("\0");
   });
@@ -62,35 +148,51 @@ function disableSourceMappingURLs(css) {
 // Lints CSS files and merges them into one file, fixing up source maps and
 // pulling any @import directives up to the top since the CSS spec does not
 // allow them to appear in the middle of a file.
-const mergeCss = Profile("mergeCss", async function (css) {
-  const hashOfFiles = hashFiles(css);
-  let merged = mergeCache.get(hashOfFiles);
-  if (merged) {
-    return merged;
-  }
-
+const mergeCss = Profile("mergeCss", async function (css, postcssConfig) {
   // Filenames passed to AST manipulator mapped to their original files
   const originals = {};
+  const deps = [];
 
-  const cssAsts = css.map(function (file) {
+  const astPromises = css.map(async function (file) {
     const filename = file.getPathInBundle();
     originals[filename] = file;
+
     let ast;
     try {
+      let content = disableSourceMappingURLs(file.getContentsAsString());
+
+      if (usePostCss(file, postcssConfig)) {
+        const result = await postcssConfig.postcss(
+          postcssConfig.plugins
+        ).process(content, {
+          from: Plugin.convertToOSPath(file.getSourcePath()),
+          parser: postcssConfig.options.parser,
+        });
+
+        result.warnings().forEach(warning => {
+          warnCb(filename, warning.toString());
+        });
+        result.messages.forEach(message => {
+          if (['dependency', 'dir-dependency'].includes(message.type)) {
+            deps.push(message);
+          }
+        });
+        content = result.css;
+      }
+
       const parseOptions = { source: filename, position: true };
-      const css = disableSourceMappingURLs(file.getContentsAsString());
-      ast = CssTools.parseCss(css, parseOptions);
+      ast = CssTools.parseCss(content, parseOptions);
       ast.filename = filename;
     } catch (e) {
       if (e.reason) {
         file.error({
           message: e.reason,
           line: e.line,
-          column: e.column
+          column: e.column,
         });
       } else {
         // Just in case it's not the normal error the library makes.
-        file.error({message: e.message});
+        file.error({message: e.stack});
       }
 
       return { type: "stylesheet", stylesheet: { rules: [] }, filename };
@@ -99,12 +201,7 @@ const mergeCss = Profile("mergeCss", async function (css) {
     return ast;
   });
 
-  const warnCb = (filename, msg) => {
-    // XXX make this a buildmessage.warning call rather than a random log.
-    //     this API would be like buildmessage.error, but wouldn't cause
-    //     the build to fail.
-    console.log(`${filename}: warn: ${msg}`);
-  };
+  const cssAsts = await Promise.all(astPromises);
 
   const mergedCssAst = CssTools.mergeCssAsts(cssAsts, warnCb);
 
@@ -112,12 +209,11 @@ const mergeCss = Profile("mergeCss", async function (css) {
   const stringifiedCss = CssTools.stringifyCss(mergedCssAst, {
     sourcemap: true,
     // don't try to read the referenced sourcemaps from the input
-    inputSourcemaps: false
+    inputSourcemaps: false,
   });
 
   if (! stringifiedCss.code) {
-    mergeCache.set(hashOfFiles, merged = { code: '' });
-    return merged;
+    return { code: '', deps };
   }
 
   // Add the contents of the input files to the source map of the new file
@@ -162,7 +258,7 @@ const mergeCss = Profile("mergeCss", async function (css) {
 
       let original = {
         line: mapping.originalLine,
-        column: mapping.originalColumn
+        column: mapping.originalColumn,
       };
 
       // If there is a source map for the original file, e.g., if it has been
@@ -198,7 +294,7 @@ const mergeCss = Profile("mergeCss", async function (css) {
       newMap.addMapping({
         generated: {
           line: mapping.generatedLine,
-          column: mapping.generatedColumn
+          column: mapping.generatedColumn,
         },
         original,
         source,
@@ -220,10 +316,16 @@ const mergeCss = Profile("mergeCss", async function (css) {
     return newMap;
   });
 
-  mergeCache.set(hashOfFiles, merged = {
+  return {
     code: stringifiedCss.code,
-    sourceMap: newMap.toString()
-  });
-
-  return merged;
+    sourceMap: newMap.toString(),
+    deps,
+  };
 });
+
+function warnCb (filename, msg) {
+  // XXX make this a buildmessage.warning call rather than a random log.
+  //     this API would be like buildmessage.error, but wouldn't cause
+  //     the build to fail.
+  Log.warn(`${filename}: warn: ${msg}`);
+};

@@ -71,15 +71,44 @@ Meteor.startup(() => {
 // Send an OAuth login method to the server. If the user authorized
 // access in the popup this should log the user in, otherwise
 // nothing should happen.
-Accounts.oauth.tryLoginAfterPopupClosed = (credentialToken, callback) => {
-  const credentialSecret = OAuth._retrieveCredentialSecret(credentialToken) || null;
-  Accounts.callLoginMethod({
-    methodArguments: [{oauth: { credentialToken, credentialSecret }}],
-    userCallback: callback && (err => callback(convertError(err))),
-    });
+Accounts.oauth.tryLoginAfterPopupClosed = (
+  credentialToken,
+  callback,
+  timeout = 1000
+) => {
+  let startTime = Date.now();
+  let calledOnce = false;
+  let intervalId;
+  const checkForCredentialSecret = (clearInterval = false) => {
+    const credentialSecret = OAuth._retrieveCredentialSecret(credentialToken);
+    if (!calledOnce && (credentialSecret || clearInterval)) {
+      calledOnce = true;
+      Meteor.clearInterval(intervalId);
+      Accounts.callLoginMethod({
+        methodArguments: [{ oauth: { credentialToken, credentialSecret } }],
+        userCallback: callback ? err => callback(convertError(err)) : () => {},
+      });
+    } else if (clearInterval) {
+      Meteor.clearInterval(intervalId);
+    }
+  };
+
+  // Check immediately
+  checkForCredentialSecret();
+
+  // Then check on an interval
+  // In some case the function OAuth._retrieveCredentialSecret() can return null, because the local storage might not
+  // be ready. So we retry after a timeout.
+  intervalId = Meteor.setInterval(() => {
+    if (Date.now() - startTime > timeout) {
+      checkForCredentialSecret(true);
+    } else {
+      checkForCredentialSecret();
+    }
+  }, 250);
 };
 
-Accounts.oauth.credentialRequestCompleteHandler = callback => 
+Accounts.oauth.credentialRequestCompleteHandler = callback =>
   credentialTokenOrError => {
     if(credentialTokenOrError && credentialTokenOrError instanceof Error) {
       callback && callback(credentialTokenOrError);
@@ -87,4 +116,3 @@ Accounts.oauth.credentialRequestCompleteHandler = callback =>
       Accounts.oauth.tryLoginAfterPopupClosed(credentialTokenOrError, callback);
     }
   }
-

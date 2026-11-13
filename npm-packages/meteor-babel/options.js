@@ -1,6 +1,6 @@
 "use strict";
 
-const getESModule = require("reify/lib/runtime/utils.js").getESModule;
+const getESModule = require("@meteorjs/reify/lib/runtime/utils.js").getESModule;
 const nodeRequire = require;
 require = function require(id) {
   const exports = nodeRequire(id);
@@ -10,7 +10,7 @@ require = function require(id) {
 const babelRuntimeVersion = require("@babel/runtime/package.json").version;
 const babelPresetMeteor = require("babel-preset-meteor");
 const babelPresetMeteorModern = require("babel-preset-meteor/modern");
-const reifyPlugin = require("reify/plugins/babel");
+const reifyPlugin = require("@meteorjs/reify/plugins/babel");
 
 function getReifyPlugin(features) {
   return [reifyPlugin, getReifyOptions(features)];
@@ -24,8 +24,10 @@ function getReifyOptions(features) {
   };
 
   if (features) {
-    if (features.modernBrowsers ||
-        features.nodeMajorVersion >= 8) {
+    // nodeMajorVersion is only set when compiling for a Node target (server,
+    // shell, tool); modernBrowsers only for modern web/cordova targets. Legacy
+    // web builds set neither, so this is a target check, not a version check.
+    if (features.modernBrowsers || features.nodeMajorVersion) {
       reifyOptions.avoidModernSyntax = false;
       reifyOptions.generateLetDeclarations = true;
     }
@@ -35,6 +37,10 @@ function getReifyOptions(features) {
       // wrap it with a function to rename the `module` identifier.
       reifyOptions.moduleAlias = "module";
     }
+
+    if (features.topLevelAwait) {
+      reifyOptions.topLevelAwait = true;
+    }
   }
 
   return reifyOptions;
@@ -42,8 +48,9 @@ function getReifyOptions(features) {
 
 exports.getDefaults = function getDefaults(features) {
   if (features) {
-    if (features.nodeMajorVersion >= 8) {
-      return getDefaultsForNode8(features);
+    // Only set for Node targets; see getReifyOptions.
+    if (features.nodeMajorVersion) {
+      return getDefaultsForNode(features);
     }
 
     if (features.modernBrowsers) {
@@ -110,7 +117,7 @@ function getDefaultsForModernBrowsers(features) {
   return finish(features, [combined]);
 }
 
-const parserOpts = require("reify/lib/parsers/babel.js").options;
+const parserOpts = require("@meteorjs/reify/lib/parsers/babel.js").options;
 const util = require("./util.js");
 
 function finish(features, presets) {
@@ -162,7 +169,7 @@ function getRuntimeTransform(features) {
   }];
 }
 
-function getDefaultsForNode8(features) {
+function getDefaultsForNode(features) {
   const combined = {
     presets: [],
     plugins: [getReifyPlugin(features)]
@@ -177,25 +184,15 @@ function getDefaultsForNode8(features) {
       combined.plugins.push(rt);
     }
 
-    // Not fully supported in Node 8 without the --harmony flag.
-    combined.plugins.push(
-      require("@babel/plugin-syntax-object-rest-spread"),
-      require("@babel/plugin-proposal-object-rest-spread")
-    );
+    if (features.useNativeAsyncAwait === false) {
+      combined.plugins.push([
+        require('./plugins/async-await.js'),
+        {
+          useNativeAsyncAwait: false,
+        },
+      ]);
+    }
 
-    // Ensure that async functions run in a Fiber, while also taking
-    // full advantage of native async/await support in Node 8.
-    combined.plugins.push([require("./plugins/async-await.js"), {
-      // Do not transform `await x` to `Promise.await(x)`, since Node
-      // 8 has native support for await expressions.
-      useNativeAsyncAwait: false
-    }]);
-
-    // Enable async generator functions proposal.
-    combined.plugins.push(require("@babel/plugin-proposal-async-generator-functions"));
-  }
-
-  if (! compileModulesOnly) {
     maybeAddReactPlugins(features, combined);
   }
 

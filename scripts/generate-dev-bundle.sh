@@ -33,8 +33,9 @@ downloadNodeFromS3() {
     S3_TGZ="node_${UNAME}_${ARCH}_v${NODE_VERSION}.tar.gz"
     NODE_URL="https://${S3_HOST}/dev-bundle-node-${NODE_BUILD_NUMBER}/${S3_TGZ}"
     echo "Downloading Node from ${NODE_URL}" >&2
-    curl "${NODE_URL}" | tar zx --strip-components 1
+    curl "${NODE_URL}" | tar zx --strip 1
 }
+
 
 downloadOfficialNode() {
     NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TGZ}"
@@ -49,12 +50,13 @@ downloadReleaseCandidateNode() {
 }
 
 # Try each strategy in the following order:
-extractNodeFromTarGz || downloadNodeFromS3 || \
-  downloadOfficialNode || downloadReleaseCandidateNode
+extractNodeFromTarGz || downloadNodeFromS3 || downloadOfficialNode || downloadReleaseCandidateNode
 
-# On macOS, download MongoDB from mongodb.com. On Linux, download a custom build
-# that is compatible with current distributions. If a 32-bit Linux is used,
-# download a 32-bit legacy version from mongodb.com instead.
+# Download MongoDB from mongodb.com. On Linux we use official builds chosen for
+# the lowest practical glibc baseline: x86_64 uses the rhel93 build (glibc 2.34,
+# keeping RHEL 9 / Amazon Linux 2023 and similar distros working), and aarch64
+# uses ubuntu2204 (the oldest official aarch64 build MongoDB publishes). If a
+# 32-bit Linux is used, download a 32-bit legacy version instead.
 MONGO_VERSION=$MONGO_VERSION_64BIT
 
 if [ $ARCH = "i686" ] && [ $OS = "linux" ]; then
@@ -63,24 +65,41 @@ fi
 
 case $OS in
     macos) MONGO_BASE_URL="https://fastdl.mongodb.org/osx" ;;
-    linux)
-        [ $ARCH = "i686" ] &&
-            MONGO_BASE_URL="https://fastdl.mongodb.org/linux" ||
-            MONGO_BASE_URL="https://github.com/meteor/mongodb-builder/releases/download/v${MONGO_VERSION}"
-        ;;
+    linux) MONGO_BASE_URL="https://fastdl.mongodb.org/linux" ;;
 esac
 
-MONGO_NAME="mongodb-${OS}-${ARCH}-${MONGO_VERSION}"
+if [ $OS = "macos" ] && [ "$(uname -m)" = "arm64" ] ; then
+  MONGO_NAME="mongodb-macos-arm64-${MONGO_VERSION}"
+elif [ $OS = "linux" ] && [ "$ARCH" = "x86_64" ] ; then
+  MONGO_NAME="mongodb-linux-x86_64-rhel93-${MONGO_VERSION}"
+elif [ $OS = "linux" ] && [ "$ARCH" != "i686" ] ; then
+  MONGO_NAME="mongodb-linux-${ARCH}-ubuntu2204-${MONGO_VERSION}"
+else
+  MONGO_NAME="mongodb-${OS}-${ARCH}-${MONGO_VERSION}"
+fi
+
 MONGO_TGZ="${MONGO_NAME}.tgz"
 MONGO_URL="${MONGO_BASE_URL}/${MONGO_TGZ}"
 echo "Downloading Mongo from ${MONGO_URL}"
-curl -L "${MONGO_URL}" | tar zx
+
+# The directory inside the archive does not reliably match the archive name:
+# macOS tarballs say "aarch64" where the URL says "arm64", and as of MongoDB 8
+# they also carry a doubled dash ("mongodb-macos-aarch64--8.0.29"). Strip that
+# top-level directory while unpacking so its name never has to be guessed at.
+rm -rf mongo-download
+mkdir mongo-download
+curl -L "${MONGO_URL}" | tar zx -C mongo-download --strip-components 1
+
+if [ ! -x "mongo-download/bin/mongod" ] || [ ! -x "mongo-download/bin/mongos" ] ; then
+    echo "${MONGO_TGZ} did not contain both mongod and mongos"
+    exit 1
+fi
 
 # Put Mongo binaries in the right spot (mongodb/bin)
 mkdir -p "mongodb/bin"
-mv "${MONGO_NAME}/bin/mongod" "mongodb/bin"
-mv "${MONGO_NAME}/bin/mongo" "mongodb/bin"
-rm -rf "${MONGO_NAME}"
+mv "mongo-download/bin/mongod" "mongodb/bin"
+mv "mongo-download/bin/mongos" "mongodb/bin"
+rm -rf mongo-download
 
 # export path so we use the downloaded node and npm
 export PATH="$DIR/bin:$PATH"
@@ -88,7 +107,11 @@ export PATH="$DIR/bin:$PATH"
 cd "$DIR/lib"
 # Overwrite the bundled version with the latest version of npm.
 npm install "npm@$NPM_VERSION"
-npm config set python `which python3`
+# Starting from npm v9.5.1 we can't set the python (and many others) config
+# https://github.com/npm/cli/issues/6126
+# for now we'll not set it anymore and see if it works
+# if it doesn't, we can set python3 in other ways
+#npm config set python `which python3`
 which node
 which npm
 npm version
@@ -135,6 +158,11 @@ cd "${DIR}/build/npm-tool-install"
 node "${CHECKOUT_DIR}/scripts/dev-bundle-tool-package.js" >package.json
 npm install
 cp -R node_modules/* "${DIR}/lib/node_modules/"
+
+#Also copy package.json and package-lock.json to lib folder so that npm
+# keep everything installed correctly
+cp package.json "${DIR}/lib/"
+cp package-lock.json "${DIR}/lib/"
 # Also include node_modules/.bin, so that `meteor npm` can make use of
 # commands like node-gyp and node-pre-gyp.
 cp -R node_modules/.bin "${DIR}/lib/node_modules/"
@@ -156,16 +184,7 @@ delete () {
     rm -rf "$1"
 }
 
-# Since we install a patched version of pacote in $DIR/lib/node_modules,
-# we need to remove npm's bundled version to make it use the new one.
-if [ -d "pacote" ]
-then
-    delete npm/node_modules/pacote
-    mv pacote npm/node_modules/
-fi
-
 delete sqlite3/deps
-delete sqlite3/node_modules/node-pre-gyp
 delete wordwrap/test
 delete moment/min
 

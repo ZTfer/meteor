@@ -7,7 +7,10 @@ import {
   isOperatorObject,
   populateDocumentWithQueryFields,
   projectionDetails,
+  setOwnProperty,
 } from './common.js';
+
+import { getAsyncMethodName } from './constants';
 
 // XXX type checking on selectors (graceful error if malformed)
 
@@ -18,7 +21,9 @@ export default class LocalCollection {
     // _id -> document (also containing id)
     this._docs = new LocalCollection._IdMap;
 
-    this._observeQueue = new Meteor._SynchronousQueue();
+    this._observeQueue = Meteor.isClient
+      ? new Meteor._SynchronousQueue()
+      : new Meteor._AsynchronousQueue();
 
     this.next_qid = 1; // live query id generator
 
@@ -37,6 +42,14 @@ export default class LocalCollection {
 
     // True when observers are paused and we should not send callbacks.
     this.paused = false;
+  }
+
+  countDocuments(selector, options) {
+    return this.find(selector ?? {}, options).countAsync();
+  }
+
+  estimatedDocumentCount(options) {
+    return this.find({}, options).countAsync();
   }
 
   // options may include sort, skip, limit, reactive
@@ -85,12 +98,14 @@ export default class LocalCollection {
 
     return this.find(selector, options).fetch()[0];
   }
-
-  // XXX possibly enforce that 'undefined' does not appear (we assume
-  // this in our handling of null and $exists)
-  insert(doc, callback) {
-    doc = EJSON.clone(doc);
-
+  async findOneAsync(selector, options = {}) {
+    if (arguments.length === 0) {
+      selector = {};
+    }
+    options.limit = 1;
+    return (await this.find(selector, options).fetchAsync())[0];
+  }
+  prepareInsert(doc) {
     assertHasValidFieldNames(doc);
 
     // if you really want to use ObjectIDs, set this global.
@@ -108,14 +123,22 @@ export default class LocalCollection {
     this._saveOriginal(id, undefined);
     this._docs.set(id, doc);
 
+    return id;
+  }
+
+  // XXX possibly enforce that 'undefined' does not appear (we assume
+  // this in our handling of null and $exists)
+  insert(doc, callback) {
+    doc = EJSON.clone(doc);
+    const id = this.prepareInsert(doc);
     const queriesToRecompute = [];
 
     // trigger live queries that match
-    Object.keys(this.queries).forEach(qid => {
+    for (const qid of Object.keys(this.queries)) {
       const query = this.queries[qid];
 
       if (query.dirty) {
-        return;
+        continue;
       }
 
       const matchResult = query.matcher.documentMatches(doc);
@@ -128,10 +151,10 @@ export default class LocalCollection {
         if (query.cursor.skip || query.cursor.limit) {
           queriesToRecompute.push(qid);
         } else {
-          LocalCollection._insertInResults(query, doc);
+          LocalCollection._insertInResultsSync(query, doc);
         }
       }
-    });
+    }
 
     queriesToRecompute.forEach(qid => {
       if (this.queries[qid]) {
@@ -140,9 +163,49 @@ export default class LocalCollection {
     });
 
     this._observeQueue.drain();
+    if (callback) {
+      Meteor.defer(() => {
+        callback(null, id);
+      });
+    }
 
-    // Defer because the caller likely doesn't expect the callback to be run
-    // immediately.
+    return id;
+  }
+  async insertAsync(doc, callback) {
+    doc = EJSON.clone(doc);
+    const id = this.prepareInsert(doc);
+    const queriesToRecompute = [];
+
+    // trigger live queries that match
+    for (const qid in this.queries) {
+      const query = this.queries[qid];
+
+      if (query.dirty) {
+        continue;
+      }
+
+      const matchResult = query.matcher.documentMatches(doc);
+
+      if (matchResult.result) {
+        if (query.distances && matchResult.distance !== undefined) {
+          query.distances.set(id, matchResult.distance);
+        }
+
+        if (query.cursor.skip || query.cursor.limit) {
+          queriesToRecompute.push(qid);
+        } else {
+          await LocalCollection._insertInResultsAsync(query, doc);
+        }
+      }
+    }
+
+    queriesToRecompute.forEach(qid => {
+      if (this.queries[qid]) {
+        this._recomputeResults(this.queries[qid]);
+      }
+    });
+
+    await this._observeQueue.drain();
     if (callback) {
       Meteor.defer(() => {
         callback(null, id);
@@ -170,38 +233,36 @@ export default class LocalCollection {
     });
   }
 
-  remove(selector, callback) {
-    // Easy special case: if we're not calling observeChanges callbacks and
-    // we're not saving originals and we got asked to remove everything, then
-    // just empty everything directly.
-    if (this.paused && !this._savedOriginals && EJSON.equals(selector, {})) {
-      const result = this._docs.size();
+  clearResultQueries(callback) {
+    const result = this._docs.size();
 
-      this._docs.clear();
+    this._docs.clear();
 
-      Object.keys(this.queries).forEach(qid => {
-        const query = this.queries[qid];
+    Object.keys(this.queries).forEach(qid => {
+      const query = this.queries[qid];
 
-        if (query.ordered) {
-          query.results = [];
-        } else {
-          query.results.clear();
-        }
-      });
-
-      if (callback) {
-        Meteor.defer(() => {
-          callback(null, result);
-        });
+      if (query.ordered) {
+        query.results = [];
+      } else {
+        query.results.clear();
       }
+    });
 
-      return result;
+    if (callback) {
+      Meteor.defer(() => {
+        callback(null, result);
+      });
     }
 
+    return result;
+  }
+
+
+  prepareRemove(selector) {
     const matcher = new Minimongo.Matcher(selector);
     const remove = [];
 
-    this._eachPossiblyMatchingDoc(selector, (doc, id) => {
+    this._eachPossiblyMatchingDocSync(selector, (doc, id) => {
       if (matcher.documentMatches(doc).result) {
         remove.push(id);
       }
@@ -234,13 +295,26 @@ export default class LocalCollection {
       this._docs.remove(removeId);
     }
 
+    return { queriesToRecompute, queryRemove, remove };
+  }
+
+  remove(selector, callback) {
+    // Easy special case: if we're not calling observeChanges callbacks and
+    // we're not saving originals and we got asked to remove everything, then
+    // just empty everything directly.
+    if (this.paused && !this._savedOriginals && EJSON.equals(selector, {})) {
+      return this.clearResultQueries(callback);
+    }
+
+    const { queriesToRecompute, queryRemove, remove } = this.prepareRemove(selector);
+
     // run live query callbacks _after_ we've removed the documents.
     queryRemove.forEach(remove => {
       const query = this.queries[remove.qid];
 
       if (query) {
         query.distances && query.distances.remove(remove.doc._id);
-        LocalCollection._removeFromResults(query, remove.doc);
+        LocalCollection._removeFromResultsSync(query, remove.doc);
       }
     });
 
@@ -265,11 +339,51 @@ export default class LocalCollection {
     return result;
   }
 
+  async removeAsync(selector, callback) {
+    // Easy special case: if we're not calling observeChanges callbacks and
+    // we're not saving originals and we got asked to remove everything, then
+    // just empty everything directly.
+    if (this.paused && !this._savedOriginals && EJSON.equals(selector, {})) {
+      return this.clearResultQueries(callback);
+    }
+
+    const { queriesToRecompute, queryRemove, remove } = this.prepareRemove(selector);
+
+    // run live query callbacks _after_ we've removed the documents.
+    for (const remove of queryRemove) {
+      const query = this.queries[remove.qid];
+
+      if (query) {
+        query.distances && query.distances.remove(remove.doc._id);
+        await LocalCollection._removeFromResultsAsync(query, remove.doc);
+      }
+    }
+    queriesToRecompute.forEach(qid => {
+      const query = this.queries[qid];
+
+      if (query) {
+        this._recomputeResults(query);
+      }
+    });
+
+    await this._observeQueue.drain();
+
+    const result = remove.length;
+
+    if (callback) {
+      Meteor.defer(() => {
+        callback(null, result);
+      });
+    }
+
+    return result;
+  }
+
   // Resume the observers. Observers immediately receive change
   // notifications to bring them to the current state of the
   // database. Note that this is not just replaying all the changes that
   // happened during the pause, it is a smarter 'coalesced' diff.
-  resumeObservers() {
+  _resumeObservers() {
     // No-op if not paused.
     if (!this.paused) {
       return;
@@ -302,7 +416,14 @@ export default class LocalCollection {
 
       query.resultsSnapshot = null;
     });
+  }
 
+  async resumeObserversServer() {
+    this._resumeObservers();
+    await this._observeQueue.drain();
+  }
+  resumeObserversClient() {
+    this._resumeObservers();
     this._observeQueue.drain();
   }
 
@@ -333,20 +454,7 @@ export default class LocalCollection {
     this._savedOriginals = new LocalCollection._IdMap;
   }
 
-  // XXX atomicity: if multi is true, and one modification fails, do
-  // we rollback the whole operation, or what?
-  update(selector, mod, options, callback) {
-    if (! callback && options instanceof Function) {
-      callback = options;
-      options = null;
-    }
-
-    if (!options) {
-      options = {};
-    }
-
-    const matcher = new Minimongo.Matcher(selector, true);
-
+  prepareUpdate(selector) {
     // Save the original results of any query that we might need to
     // _recomputeResults on, because _modifyAndNotify will mutate the objects in
     // it. (We don't need to save the original results of paused queries because
@@ -400,20 +508,64 @@ export default class LocalCollection {
       }
     });
 
-    const recomputeQids = {};
+    return qidToOriginalResults;
+  }
+
+  finishUpdate({ options, updateCount, callback, insertedId }) {
+
+
+    // Return the number of affected documents, or in the upsert case, an object
+    // containing the number of affected docs and the id of the doc that was
+    // inserted, if any.
+    let result;
+    if (options._returnObject) {
+      result = { numberAffected: updateCount };
+
+      if (insertedId !== undefined) {
+        result.insertedId = insertedId;
+      }
+    } else {
+      result = updateCount;
+    }
+
+    if (callback) {
+      Meteor.defer(() => {
+        callback(null, result);
+      });
+    }
+
+    return result;
+  }
+
+  // XXX atomicity: if multi is true, and one modification fails, do
+  // we rollback the whole operation, or what?
+  async updateAsync(selector, mod, options, callback) {
+    if (! callback && options instanceof Function) {
+      callback = options;
+      options = null;
+    }
+
+    if (!options) {
+      options = {};
+    }
+
+    const matcher = new Minimongo.Matcher(selector, true);
+
+    const qidToOriginalResults = this.prepareUpdate(selector);
+
+    let recomputeQids = {};
 
     let updateCount = 0;
 
-    this._eachPossiblyMatchingDoc(selector, (doc, id) => {
+    await this._eachPossiblyMatchingDocAsync(selector, async (doc, id) => {
       const queryResult = matcher.documentMatches(doc);
 
       if (queryResult.result) {
         // XXX Should we save the original even if mod ends up being a no-op?
         this._saveOriginal(id, doc);
-        this._modifyAndNotify(
+        recomputeQids = await this._modifyAndNotifyAsync(
           doc,
           mod,
-          recomputeQids,
           queryResult.arrayIndices
         );
 
@@ -435,7 +587,7 @@ export default class LocalCollection {
       }
     });
 
-    this._observeQueue.drain();
+    await this._observeQueue.drain();
 
     // If we are doing an upsert, and we didn't modify any documents yet, then
     // it's time to do an insert. Figure out what document we are inserting, and
@@ -443,7 +595,80 @@ export default class LocalCollection {
     let insertedId;
     if (updateCount === 0 && options.upsert) {
       const doc = LocalCollection._createUpsertDocument(selector, mod);
-      if (! doc._id && options.insertedId) {
+      if (!doc._id && options.insertedId) {
+        doc._id = options.insertedId;
+      }
+
+      insertedId = await this.insertAsync(doc);
+      updateCount = 1;
+    }
+
+    return this.finishUpdate({
+      options,
+      insertedId,
+      updateCount,
+      callback,
+    });
+  }
+  // XXX atomicity: if multi is true, and one modification fails, do
+  // we rollback the whole operation, or what?
+  update(selector, mod, options, callback) {
+    if (! callback && options instanceof Function) {
+      callback = options;
+      options = null;
+    }
+
+    if (!options) {
+      options = {};
+    }
+
+    const matcher = new Minimongo.Matcher(selector, true);
+
+    const qidToOriginalResults = this.prepareUpdate(selector);
+
+    let recomputeQids = {};
+
+    let updateCount = 0;
+
+    this._eachPossiblyMatchingDocSync(selector, (doc, id) => {
+      const queryResult = matcher.documentMatches(doc);
+
+      if (queryResult.result) {
+        // XXX Should we save the original even if mod ends up being a no-op?
+        this._saveOriginal(id, doc);
+        recomputeQids = this._modifyAndNotifySync(
+          doc,
+          mod,
+          queryResult.arrayIndices
+        );
+
+        ++updateCount;
+
+        if (!options.multi) {
+          return false; // break
+        }
+      }
+
+      return true;
+    });
+
+    Object.keys(recomputeQids).forEach(qid => {
+      const query = this.queries[qid];
+      if (query) {
+        this._recomputeResults(query, qidToOriginalResults[qid]);
+      }
+    });
+
+    this._observeQueue.drain();
+
+
+    // If we are doing an upsert, and we didn't modify any documents yet, then
+    // it's time to do an insert. Figure out what document we are inserting, and
+    // generate an id for it.
+    let insertedId;
+    if (updateCount === 0 && options.upsert) {
+      const doc = LocalCollection._createUpsertDocument(selector, mod);
+      if (!doc._id && options.insertedId) {
         doc._id = options.insertedId;
       }
 
@@ -451,27 +676,15 @@ export default class LocalCollection {
       updateCount = 1;
     }
 
-    // Return the number of affected documents, or in the upsert case, an object
-    // containing the number of affected docs and the id of the doc that was
-    // inserted, if any.
-    let result;
-    if (options._returnObject) {
-      result = {numberAffected: updateCount};
 
-      if (insertedId !== undefined) {
-        result.insertedId = insertedId;
-      }
-    } else {
-      result = updateCount;
-    }
-
-    if (callback) {
-      Meteor.defer(() => {
-        callback(null, result);
-      });
-    }
-
-    return result;
+    return this.finishUpdate({
+      options,
+      insertedId,
+      updateCount,
+      callback,
+      selector,
+      mod,
+    });
   }
 
   // A convenience wrapper on update. LocalCollection.upsert(sel, mod) is
@@ -491,27 +704,56 @@ export default class LocalCollection {
     );
   }
 
+  upsertAsync(selector, mod, options, callback) {
+    if (!callback && typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
+
+    return this.updateAsync(
+      selector,
+      mod,
+      Object.assign({}, options, {upsert: true, _returnObject: true}),
+      callback
+    );
+  }
+
   // Iterates over a subset of documents that could match selector; calls
   // fn(doc, id) on each of them.  Specifically, if selector specifies
   // specific _id's, it only looks at those.  doc is *not* cloned: it is the
   // same object that is in _docs.
-  _eachPossiblyMatchingDoc(selector, fn) {
+  async _eachPossiblyMatchingDocAsync(selector, fn) {
     const specificIds = LocalCollection._idsMatchedBySelector(selector);
 
     if (specificIds) {
-      specificIds.some(id => {
+      for (const id of specificIds) {
         const doc = this._docs.get(id);
 
-        if (doc) {
-          return fn(doc, id) === false;
+        if (doc && ! (await fn(doc, id))) {
+          break
         }
-      });
+      }
+    } else {
+      await this._docs.forEachAsync(fn);
+    }
+  }
+  _eachPossiblyMatchingDocSync(selector, fn) {
+    const specificIds = LocalCollection._idsMatchedBySelector(selector);
+
+    if (specificIds) {
+      for (const id of specificIds) {
+        const doc = this._docs.get(id);
+
+        if (doc && fn(doc, id) === false) {
+          break
+        }
+      }
     } else {
       this._docs.forEach(fn);
     }
   }
 
-  _modifyAndNotify(doc, mod, recomputeQids, arrayIndices) {
+  _getMatchedDocAndModify(doc, mod, arrayIndices) {
     const matched_before = {};
 
     Object.keys(this.queries).forEach(qid => {
@@ -530,15 +772,23 @@ export default class LocalCollection {
       }
     });
 
-    const old_doc = EJSON.clone(doc);
+    return matched_before;
+  }
 
+  _modifyAndNotifySync(doc, mod, arrayIndices) {
+
+    const matched_before = this._getMatchedDocAndModify(doc, mod, arrayIndices);
+
+    const old_doc = EJSON.clone(doc);
     LocalCollection._modify(doc, mod, {arrayIndices});
 
-    Object.keys(this.queries).forEach(qid => {
+    const recomputeQids = {};
+
+    for (const qid of Object.keys(this.queries)) {
       const query = this.queries[qid];
 
       if (query.dirty) {
-        return;
+        continue;
       }
 
       const afterMatch = query.matcher.documentMatches(doc);
@@ -561,13 +811,59 @@ export default class LocalCollection {
           recomputeQids[qid] = true;
         }
       } else if (before && !after) {
-        LocalCollection._removeFromResults(query, doc);
+        LocalCollection._removeFromResultsSync(query, doc);
       } else if (!before && after) {
-        LocalCollection._insertInResults(query, doc);
+        LocalCollection._insertInResultsSync(query, doc);
       } else if (before && after) {
-        LocalCollection._updateInResults(query, doc, old_doc);
+        LocalCollection._updateInResultsSync(query, doc, old_doc);
       }
-    });
+    }
+    return recomputeQids;
+  }
+
+  async _modifyAndNotifyAsync(doc, mod, arrayIndices) {
+
+    const matched_before = this._getMatchedDocAndModify(doc, mod, arrayIndices);
+
+    const old_doc = EJSON.clone(doc);
+    LocalCollection._modify(doc, mod, {arrayIndices});
+
+    const recomputeQids = {};
+    for (const qid in this.queries) {
+      const query = this.queries[qid];
+
+      if (query.dirty) {
+        continue;
+      }
+
+      const afterMatch = query.matcher.documentMatches(doc);
+      const after = afterMatch.result;
+      const before = matched_before[qid];
+
+      if (after && query.distances && afterMatch.distance !== undefined) {
+        query.distances.set(doc._id, afterMatch.distance);
+      }
+
+      if (query.cursor.skip || query.cursor.limit) {
+        // We need to recompute any query where the doc may have been in the
+        // cursor's window either before or after the update. (Note that if skip
+        // or limit is set, "before" and "after" being true do not necessarily
+        // mean that the document is in the cursor's output after skip/limit is
+        // applied... but if they are false, then the document definitely is NOT
+        // in the output. So it's safe to skip recompute if neither before or
+        // after are true.)
+        if (before || after) {
+          recomputeQids[qid] = true;
+        }
+      } else if (before && !after) {
+        await LocalCollection._removeFromResultsAsync(query, doc);
+      } else if (!before && after) {
+        await LocalCollection._insertInResultsAsync(query, doc);
+      } else if (before && after) {
+        await LocalCollection._updateInResultsAsync(query, doc, old_doc);
+      }
+    }
+    return recomputeQids;
   }
 
   // Recomputes the results of a query and runs observe callbacks for the
@@ -689,8 +985,6 @@ LocalCollection._CachingChangeObserver = class _CachingChangeObserver {
           this.docs.putBefore(id, doc, before || null);
         },
         movedBefore: (id, before) => {
-          const doc = this.docs.get(id);
-
           if (callbacks.movedBefore) {
             callbacks.movedBefore.call(this, id, before);
           }
@@ -889,11 +1183,11 @@ LocalCollection._compileProjection = fields => {
       if (rule === Object(rule)) {
         // For sub-objects/subsets we branch
         if (doc[key] === Object(doc[key])) {
-          result[key] = transform(doc[key], rule);
+          setOwnProperty(result, key, transform(doc[key], rule));
         }
       } else if (details.including) {
         // Otherwise we don't even touch this subfield
-        result[key] = EJSON.clone(doc[key]);
+        setOwnProperty(result, key, EJSON.clone(doc[key]));
       } else {
         delete result[key];
       }
@@ -941,7 +1235,7 @@ LocalCollection._createUpsertDocument = (selector, modifier) => {
   }
 
   // Replacement can take _id from query document
-  const replacement = Object.assign({}, modifier);
+  const replacement = {...modifier};
   if (newDoc._id) {
     replacement._id = newDoc._id;
   }
@@ -1032,7 +1326,7 @@ LocalCollection._idsMatchedBySelector = selector => {
   return null;
 };
 
-LocalCollection._insertInResults = (query, doc) => {
+LocalCollection._insertInResultsSync = (query, doc) => {
   const fields = EJSON.clone(doc);
 
   delete fields._id;
@@ -1061,6 +1355,39 @@ LocalCollection._insertInResults = (query, doc) => {
     query.added(doc._id, query.projectionFn(fields));
   } else {
     query.added(doc._id, query.projectionFn(fields));
+    query.results.set(doc._id, doc);
+  }
+};
+
+LocalCollection._insertInResultsAsync = async (query, doc) => {
+  const fields = EJSON.clone(doc);
+
+  delete fields._id;
+
+  if (query.ordered) {
+    if (!query.sorter) {
+      await query.addedBefore(doc._id, query.projectionFn(fields), null);
+      query.results.push(doc);
+    } else {
+      const i = LocalCollection._insertInSortedList(
+        query.sorter.getComparator({distances: query.distances}),
+        query.results,
+        doc
+      );
+
+      let next = query.results[i + 1];
+      if (next) {
+        next = next._id;
+      } else {
+        next = null;
+      }
+
+      await query.addedBefore(doc._id, query.projectionFn(fields), next);
+    }
+
+    await query.added(doc._id, query.projectionFn(fields));
+  } else {
+    await query.added(doc._id, query.projectionFn(fields));
     query.results.set(doc._id, doc);
   }
 };
@@ -1197,7 +1524,7 @@ LocalCollection._modify = (doc, modifier, options = {}) => {
   });
 
   Object.keys(newDoc).forEach(key => {
-    doc[key] = newDoc[key];
+    setOwnProperty(doc, key, newDoc[key]);
   });
 };
 
@@ -1215,7 +1542,8 @@ LocalCollection._observeFromObserveChanges = (cursor, observeCallbacks) => {
 
     observeChangesCallbacks = {
       addedBefore(id, fields, before) {
-        if (suppressed || !(observeCallbacks.addedAt || observeCallbacks.added)) {
+        const check = suppressed || !(observeCallbacks.addedAt || observeCallbacks.added)
+        if (check) {
           return;
         }
 
@@ -1223,19 +1551,20 @@ LocalCollection._observeFromObserveChanges = (cursor, observeCallbacks) => {
 
         if (observeCallbacks.addedAt) {
           observeCallbacks.addedAt(
-            doc,
-            indices
-              ? before
-                ? this.docs.indexOf(before)
-                : this.docs.size()
-              : -1,
-            before
+              doc,
+              indices
+                  ? before
+                      ? this.docs.indexOf(before)
+                      : this.docs.size()
+                  : -1,
+              before
           );
         } else {
           observeCallbacks.added(doc);
         }
       },
       changed(id, fields) {
+
         if (!(observeCallbacks.changedAt || observeCallbacks.changed)) {
           return;
         }
@@ -1251,9 +1580,9 @@ LocalCollection._observeFromObserveChanges = (cursor, observeCallbacks) => {
 
         if (observeCallbacks.changedAt) {
           observeCallbacks.changedAt(
-            transform(doc),
-            oldDoc,
-            indices ? this.docs.indexOf(id) : -1
+              transform(doc),
+              oldDoc,
+              indices ? this.docs.indexOf(id) : -1
           );
         } else {
           observeCallbacks.changed(transform(doc), oldDoc);
@@ -1266,10 +1595,10 @@ LocalCollection._observeFromObserveChanges = (cursor, observeCallbacks) => {
 
         const from = indices ? this.docs.indexOf(id) : -1;
         let to = indices
-          ? before
-            ? this.docs.indexOf(before)
-            : this.docs.size()
-          : -1;
+            ? before
+                ? this.docs.indexOf(before)
+                : this.docs.size()
+            : -1;
 
         // When not moving backwards, adjust for the fact that removing the
         // document slides everything back one slot.
@@ -1278,10 +1607,10 @@ LocalCollection._observeFromObserveChanges = (cursor, observeCallbacks) => {
         }
 
         observeCallbacks.movedTo(
-          transform(EJSON.clone(this.docs.get(id))),
-          from,
-          to,
-          before || null
+            transform(EJSON.clone(this.docs.get(id))),
+            from,
+            to,
+            before || null
         );
       },
       removed(id) {
@@ -1315,8 +1644,8 @@ LocalCollection._observeFromObserveChanges = (cursor, observeCallbacks) => {
           DiffSequence.applyChanges(doc, fields);
 
           observeCallbacks.changed(
-            transform(doc),
-            transform(EJSON.clone(oldDoc))
+              transform(doc),
+              transform(EJSON.clone(oldDoc))
           );
         }
       },
@@ -1337,10 +1666,20 @@ LocalCollection._observeFromObserveChanges = (cursor, observeCallbacks) => {
   // This is tested by the `mongo-livedata - (extended) scribbling` tests
   changeObserver.applyChange._fromObserve = true;
   const handle = cursor.observeChanges(changeObserver.applyChange,
-    { nonMutatingCallbacks: true });
+      { nonMutatingCallbacks: true });
 
-  suppressed = false;
-
+  // If needed, re-enable callbacks as soon as the initial batch is ready.
+  const setSuppressed = (h) => {
+    if (h.isReady) suppressed = false;
+    else h.isReadyPromise?.then(() => (suppressed = false));
+  };
+  // When we call cursor.observeChanges() it can be the on from
+  // the mongo package (instead of the minimongo one) and it doesn't have isReady and isReadyPromise
+  if (Meteor._isPromise(handle)) {
+    handle.then(setSuppressed);
+  } else {
+    setSuppressed(handle);
+  }
   return handle;
 };
 
@@ -1373,7 +1712,7 @@ LocalCollection._observeChangesCallbacksAreOrdered = callbacks => {
   return !!(callbacks.addedBefore || callbacks.movedBefore);
 };
 
-LocalCollection._removeFromResults = (query, doc) => {
+LocalCollection._removeFromResultsSync = (query, doc) => {
   if (query.ordered) {
     const i = LocalCollection._findInOrderedResults(query, doc);
 
@@ -1382,7 +1721,21 @@ LocalCollection._removeFromResults = (query, doc) => {
   } else {
     const id = doc._id;  // in case callback mutates doc
 
-    query.removed(doc._id);
+    query.removed(id);
+    query.results.remove(id);
+  }
+};
+
+LocalCollection._removeFromResultsAsync = async (query, doc) => {
+  if (query.ordered) {
+    const i = LocalCollection._findInOrderedResults(query, doc);
+
+    await query.removed(doc._id);
+    query.results.splice(i, 1);
+  } else {
+    const id = doc._id;  // in case callback mutates doc
+
+    await query.removed(id);
     query.results.remove(id);
   }
 };
@@ -1397,11 +1750,12 @@ LocalCollection._selectorIsId = selector =>
 // Is the selector just lookup by _id (shorthand or not)?
 LocalCollection._selectorIsIdPerhapsAsObject = selector =>
   LocalCollection._selectorIsId(selector) ||
-  LocalCollection._selectorIsId(selector && selector._id) &&
+  selector != null && hasOwn.call(selector, '_id') &&
+  LocalCollection._selectorIsId(selector._id) &&
   Object.keys(selector).length === 1
 ;
 
-LocalCollection._updateInResults = (query, doc, old_doc) => {
+LocalCollection._updateInResultsSync = (query, doc, old_doc) => {
   if (!EJSON.equals(doc._id, old_doc._id)) {
     throw new Error('Can\'t change a doc\'s _id while updating');
   }
@@ -1452,6 +1806,57 @@ LocalCollection._updateInResults = (query, doc, old_doc) => {
   }
 };
 
+LocalCollection._updateInResultsAsync = async (query, doc, old_doc) => {
+  if (!EJSON.equals(doc._id, old_doc._id)) {
+    throw new Error('Can\'t change a doc\'s _id while updating');
+  }
+
+  const projectionFn = query.projectionFn;
+  const changedFields = DiffSequence.makeChangedFields(
+    projectionFn(doc),
+    projectionFn(old_doc)
+  );
+
+  if (!query.ordered) {
+    if (Object.keys(changedFields).length) {
+      await query.changed(doc._id, changedFields);
+      query.results.set(doc._id, doc);
+    }
+
+    return;
+  }
+
+  const old_idx = LocalCollection._findInOrderedResults(query, doc);
+
+  if (Object.keys(changedFields).length) {
+    await query.changed(doc._id, changedFields);
+  }
+
+  if (!query.sorter) {
+    return;
+  }
+
+  // just take it out and put it back in again, and see if the index changes
+  query.results.splice(old_idx, 1);
+
+  const new_idx = LocalCollection._insertInSortedList(
+    query.sorter.getComparator({distances: query.distances}),
+    query.results,
+    doc
+  );
+
+  if (old_idx !== new_idx) {
+    let next = query.results[new_idx + 1];
+    if (next) {
+      next = next._id;
+    } else {
+      next = null;
+    }
+
+    query.movedBefore && await query.movedBefore(doc._id, next);
+  }
+};
+
 const MODIFIERS = {
   $currentDate(target, field, arg) {
     if (typeof arg === 'object' && hasOwn.call(arg, '$type')) {
@@ -1466,14 +1871,14 @@ const MODIFIERS = {
       throw MinimongoError('Invalid $currentDate modifier', {field});
     }
 
-    target[field] = new Date();
+    setOwnProperty(target, field, new Date());
   },
   $inc(target, field, arg) {
     if (typeof arg !== 'number') {
       throw MinimongoError('Modifier $inc allowed for numbers only', {field});
     }
 
-    if (field in target) {
+    if (hasOwn.call(target, field)) {
       if (typeof target[field] !== 'number') {
         throw MinimongoError(
           'Cannot apply $inc modifier to non-number',
@@ -1483,7 +1888,7 @@ const MODIFIERS = {
 
       target[field] += arg;
     } else {
-      target[field] = arg;
+      setOwnProperty(target, field, arg);
     }
   },
   $min(target, field, arg) {
@@ -1491,7 +1896,7 @@ const MODIFIERS = {
       throw MinimongoError('Modifier $min allowed for numbers only', {field});
     }
 
-    if (field in target) {
+    if (hasOwn.call(target, field)) {
       if (typeof target[field] !== 'number') {
         throw MinimongoError(
           'Cannot apply $min modifier to non-number',
@@ -1500,10 +1905,10 @@ const MODIFIERS = {
       }
 
       if (target[field] > arg) {
-        target[field] = arg;
+        setOwnProperty(target, field, arg);
       }
     } else {
-      target[field] = arg;
+      setOwnProperty(target, field, arg);
     }
   },
   $max(target, field, arg) {
@@ -1511,7 +1916,7 @@ const MODIFIERS = {
       throw MinimongoError('Modifier $max allowed for numbers only', {field});
     }
 
-    if (field in target) {
+    if (hasOwn.call(target, field)) {
       if (typeof target[field] !== 'number') {
         throw MinimongoError(
           'Cannot apply $max modifier to non-number',
@@ -1520,10 +1925,10 @@ const MODIFIERS = {
       }
 
       if (target[field] < arg) {
-        target[field] = arg;
+        setOwnProperty(target, field, arg);
       }
     } else {
-      target[field] = arg;
+      setOwnProperty(target, field, arg);
     }
   },
   $mul(target, field, arg) {
@@ -1531,7 +1936,7 @@ const MODIFIERS = {
       throw MinimongoError('Modifier $mul allowed for numbers only', {field});
     }
 
-    if (field in target) {
+    if (hasOwn.call(target, field)) {
       if (typeof target[field] !== 'number') {
         throw MinimongoError(
           'Cannot apply $mul modifier to non-number',
@@ -1541,7 +1946,7 @@ const MODIFIERS = {
 
       target[field] *= arg;
     } else {
-      target[field] = 0;
+      setOwnProperty(target, field, 0);
     }
   },
   $rename(target, field, arg, keypath, doc) {
@@ -1582,7 +1987,7 @@ const MODIFIERS = {
       throw MinimongoError('$rename target field invalid', {field});
     }
 
-    target2[keyparts.pop()] = object;
+    setOwnProperty(target2, keyparts.pop(), object);
   },
   $set(target, field, arg) {
     if (target !== Object(target)) { // not an array or an object
@@ -1602,7 +2007,7 @@ const MODIFIERS = {
 
     assertHasValidFieldNames(arg);
 
-    target[field] = arg;
+    setOwnProperty(target, field, arg);
   },
   $setOnInsert(target, field, arg) {
     // converted to `$set` in `_modify`
@@ -1610,7 +2015,7 @@ const MODIFIERS = {
   $unset(target, field, arg) {
     if (target !== undefined) {
       if (target instanceof Array) {
-        if (field in target) {
+        if (hasOwn.call(target, field)) {
           target[field] = null;
         }
       } else {
@@ -1619,8 +2024,8 @@ const MODIFIERS = {
     }
   },
   $push(target, field, arg) {
-    if (target[field] === undefined) {
-      target[field] = [];
+    if (!hasOwn.call(target, field) || target[field] === undefined) {
+      setOwnProperty(target, field, []);
     }
 
     if (!(target[field] instanceof Array)) {
@@ -1720,11 +2125,11 @@ const MODIFIERS = {
     // Actually slice.
     if (slice !== undefined) {
       if (slice === 0) {
-        target[field] = []; // differs from Array.slice!
+        setOwnProperty(target, field, []); // differs from Array.slice!
       } else if (slice < 0) {
-        target[field] = target[field].slice(slice);
+        setOwnProperty(target, field, target[field].slice(slice));
       } else {
-        target[field] = target[field].slice(0, slice);
+        setOwnProperty(target, field, target[field].slice(0, slice));
       }
     }
   },
@@ -1735,10 +2140,10 @@ const MODIFIERS = {
 
     assertHasValidFieldNames(arg);
 
-    const toPush = target[field];
+    const toPush = hasOwn.call(target, field) ? target[field] : undefined;
 
     if (toPush === undefined) {
-      target[field] = arg;
+      setOwnProperty(target, field, arg);
     } else if (!(toPush instanceof Array)) {
       throw MinimongoError(
         'Cannot apply $pushAll modifier to non-array',
@@ -1763,9 +2168,9 @@ const MODIFIERS = {
 
     assertHasValidFieldNames(values);
 
-    const toAdd = target[field];
+    const toAdd = hasOwn.call(target, field) ? target[field] : undefined;
     if (toAdd === undefined) {
-      target[field] = values;
+      setOwnProperty(target, field, values);
     } else if (!(toAdd instanceof Array)) {
       throw MinimongoError(
         'Cannot apply $addToSet modifier to non-array',
@@ -1837,7 +2242,7 @@ const MODIFIERS = {
       out = toPull.filter(element => !LocalCollection._f._equal(element, arg));
     }
 
-    target[field] = out;
+    setOwnProperty(target, field, out);
   },
   $pullAll(target, field, arg) {
     if (!(typeof arg === 'object' && arg instanceof Array)) {
@@ -1864,9 +2269,9 @@ const MODIFIERS = {
       );
     }
 
-    target[field] = toPull.filter(object =>
+    setOwnProperty(target, field, toPull.filter(object =>
       !arg.some(element => LocalCollection._f._equal(object, element))
-    );
+    ));
   },
   $bit(target, field, arg) {
     // XXX mongo only supports $bit on integers, and we only support
@@ -1890,11 +2295,12 @@ const NO_CREATE_MODIFIERS = {
 };
 
 // Make sure field names do not contain Mongo restricted
-// characters ('.', '$', '\0').
+// characters ('$', '\0') or invalid dot usage (leading/trailing/consecutive '.').
 // https://docs.mongodb.com/manual/reference/limits/#Restrictions-on-Field-Names
 const invalidCharMsg = {
   $: 'start with \'$\'',
-  '.': 'contain \'.\'',
+  '.': 'start or end with \'.\'',
+  '..': 'contain consecutive dots',
   '\0': 'contain null bytes'
 };
 
@@ -1910,7 +2316,7 @@ function assertHasValidFieldNames(doc) {
 
 function assertIsValidFieldName(key) {
   let match;
-  if (typeof key === 'string' && (match = key.match(/^\$|\.|\0/))) {
+  if (typeof key === 'string' && (match = key.match(/^\$|^\.|\.\.|\.$|^\.$|\0/))) {
     throw MinimongoError(`Key ${key} must not ${invalidCharMsg[match[0]]}`);
   }
 }
@@ -2007,13 +2413,13 @@ function findModTarget(doc, keyparts, options = {}) {
     } else {
       assertIsValidFieldName(keypart);
 
-      if (!(keypart in doc)) {
+      if (!hasOwn.call(doc, keypart)) {
         if (options.noCreate) {
           return undefined;
         }
 
         if (!last) {
-          doc[keypart] = {};
+          setOwnProperty(doc, keypart, {});
         }
       }
     }

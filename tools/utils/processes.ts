@@ -39,16 +39,23 @@ type ExecFileOptions = {
    * the promise when the child process exits.
    */
   waitForClose?: boolean,
+
+  /**
+   * Quote command-line tokens containing whitespace when cmd.exe is used.
+   * Opt-in so existing Windows callers retain their established behavior.
+   */
+  quoteArgsOnWindows?: boolean,
 }
 
  /**
+  * @deprecated
   * @summary Executes a command synchronously, returning either the captured
   * stdout output or throwing an error containing the stderr output as part of
   * the message. In addition, the error will contain fields pid, stderr, stdout,
   * status and signal.
   * @param command The command to run
   * @param args List of string arguments
-  * @param options 
+  * @param options
   * @returns The stdout from the command
   */
 export function execFileSync(
@@ -56,8 +63,7 @@ export function execFileSync(
   args?: ReadonlyArray<string> | ExecFileOptions,
   options?: ExecFileOptions
 ) {
-  const meteorPromise: any = Promise; // TypeScript doesn't recognize "Promise.await"
-  return meteorPromise.await(execFileAsync(command, args, options));
+  return execFileAsync(command, args, options);
 }
 
  /**
@@ -67,7 +73,7 @@ export function execFileSync(
   * the error will contain fields pid, stderr, stdout, status and signal.
   * @param command The command to run
   * @param args List of string arguments
-  * @param options 
+  * @param options
   */
 export function execFileAsync(
   command: string,
@@ -96,7 +102,7 @@ export function execFileAsync(
   const exitEvent = options.waitForClose ? 'close' : 'exit';
 
   return new Promise((resolve, reject) => {
-    let child: ReturnType<typeof child_process.exec>; 
+    let child: ReturnType<typeof child_process.exec>;
     const spawnArgs: ReadonlyArray<string> = Array.isArray(args) ? args : [];
     const { cwd, env, stdio } = options;
 
@@ -104,10 +110,19 @@ export function execFileAsync(
       child = child_process.spawn(command, spawnArgs, { cwd, env, stdio });
     } else {
       // https://github.com/nodejs/node-v0.x-archive/issues/2318
-      spawnArgs.forEach(arg => {
-        command += ' ' + arg;
-      });
-      child = child_process.exec(command, { cwd, env });
+      if (options.quoteArgsOnWindows) {
+        // The command and args are joined into a single cmd.exe command
+        // line, so tokens containing whitespace must be quoted.
+        const quoteForCmd = (s: string) =>
+          /[\s"]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s;
+        command = [command, ...spawnArgs].map(quoteForCmd).join(' ');
+      } else {
+        // Preserve the historical behavior for all existing callers.
+        spawnArgs.forEach(arg => {
+          command += ' ' + arg;
+        });
+      }
+      child = child_process.spawn(command, { cwd, env, shell: true });
     }
 
     let capturedStdout = '';

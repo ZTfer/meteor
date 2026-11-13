@@ -73,6 +73,7 @@ Options:
                    uses port N+1 and a port specified by --app-port.
                    Specify as --port=host:port to bind to a specific
                    interface.
+  --open, -o       Opens a browser window when the app starts.
   --inspect[-brk][=<port>]
                    Enable server-side debugging via debugging clients like
                    the Node.js command-line debugger, Chrome DevTools, or
@@ -89,7 +90,8 @@ Options:
                    Meteor app source code as by default the port is generated
                    using the id inside .meteor/.id file.
   --production     Simulate production mode. Minify and bundle CSS and JS files.
-  --raw-logs       Run without parsing logs from stdout and stderr.
+  --raw-logs       Run without parsing logs from stdout and stderr (default: true).
+  --timestamps     Run with timestamps in logs, the same as passing `--raw-logs=false`.
   --settings, -s   Set optional data for Meteor.settings on the server.
   --release        Specify the release of Meteor to use.
   --verbose        Print all output from builds logs.
@@ -106,6 +108,7 @@ Options:
   --exclude-archs  Don't create bundles for certain web architectures
                   (comma separated, for example:
                    --exclude-archs "web.browser.legacy, web.cordova")
+  --open           Opens a browser window when it finishes building
 
 >>> debug
 Run the project with server-side debugging enabled.
@@ -150,8 +153,11 @@ Options:
 
 >>> create
 Create a new project.
-Usage: meteor create [--release <release>] [--bare|--minimal|--full|--react|--vue|--apollo|--svelte|--blaze] <path>
-       meteor create [--release <release>] --example <example_name> [<path>]
+Usage: meteor create [--release <release>] [--bare|--minimal|--full|--pnpm|--react|--vue|--apollo|--svelte|--blaze|--tailwind|--chakra-ui|--solid|--babel|--coffeescript|--angular] <path>
+       meteor create [--release <release>] --example <slug> [<path>]
+       meteor create [--release <release>] <url> [<path>] [--from-branch <branch>] [--from-dir <dir>]
+       meteor create [--release <release>] <path> <url> [--from-branch <branch>] [--from-dir <dir>]
+       meteor create [--release <release>] --from <url> [--from-branch <branch>] [--from-dir <dir>] [<path>]
        meteor create --list
        meteor create --package [<package_name>]
 
@@ -172,22 +178,48 @@ package created in an app, will be created using the application's version of
 meteor and a package created outside a meteor app will use the latest release).
 
 You can pass --example to start off with a copy of one of the Meteor
-sample applications. Use --list to see the available examples. There are
-currently no package examples.
+community examples. Use --list to see the available examples.
 
-Options:
-  --package     Create a new meteor package instead of an app.
-  --example     Example template to use.
-  --list        Show list of available examples.
-  --bare        Create an empty app.
-  --minimal     Create an app with as few Meteor packages as possible.
-  --full        Create a fully scaffolded app.
-  --react       Create a basic react-based app, same as default.
-  --vue         Create a basic vue-based app.
-  --apollo      Create a basic apollo-based app.
-  --svelte      Create a basic svelte-based app.
-  --typescript  Create a basic Typescript React-based app.
-  --blaze       Create a basic blaze-based app.
+You can clone a Meteor project from a Git URL by passing the URL as the only
+argument, by passing a path and URL together, or by passing the URL explicitly
+with --from. When only a URL is provided, the app directory is derived from the
+repository or subdirectory name.
+GitHub shorthand such as owner/repo is supported with --from owner/repo.
+Positional inference requires a full URL so paths like apps/my-app keep their
+existing meaning.
+
+Skeleton options:
+  --bare         Create an empty app.
+  --minimal      Create an app with as few Meteor packages as possible.
+  --full         Create a fully scaffolded app.
+  --pnpm         Create a pnpm monorepo with a Meteor app in apps/app.
+  --react        Create a basic react-based app, same as default.
+  --vue          Create a basic vue3-based app.
+  --apollo       Create a basic apollo-based app.
+  --svelte       Create a basic svelte-based app.
+  --typescript   Create a basic Typescript React-based app.
+  --blaze        Create a basic blaze-based app.
+  --pwa          Create a basic blaze-based app, installable as a PWA.
+  --tailwind     Create a basic react-based app, with tailwind configured.
+  --chakra-ui    Create a basic react-based app, with chakra-ui configured.
+  --coffeescript Create a basic coffescript app, with react.
+  --babel        Create a React app with Babel support.
+  --solid        Create a basic solid-based app.
+  --angular      Create a basic Angular app.
+  --prototype    Create a prototype app with the insecure & autopublish packages.
+
+Example options:
+  --example      Create from a community example (use --list to browse).
+  --list         Show detailed list of available examples.
+  --from         Clone a Meteor project from a Git URL. Accepts GitHub, GitLab,
+                 and Bitbucket tree/src URLs. branch and subdirectory are
+                 auto-detected from the URL when possible.
+                 Optional when a positional source is an unambiguous Git URL.
+  --from-branch  Branch to clone from (overrides branch parsed from URL).
+  --from-dir     Extract only a subdirectory (overrides dir parsed from URL).
+
+Other options:
+  --package      Create a new meteor package instead of an app.
 
 
 >>> update
@@ -206,10 +238,10 @@ conflicts with other packages in the app.
 Passing the --patch argument will update to the latest patch, if such exists.
 Patch releases contain very minor changes, usually bug fixes. Updating to
 the latest patch is always recommended. This will try to not update non-core
-packages unless strictly nessessary.
+packages unless strictly necessary.
 
 Passing the --release argument will force update to a specific release of
-meteor.  This will not update non-core packages unless strictly nessessary. It
+meteor.  This will not update non-core packages unless strictly necessary. It
 is also possible that some packages cannot be updated to be compatible with the
 new release. If that happens, the app will not build until dependencies on those
 packages are removed.
@@ -252,11 +284,23 @@ internal functionality of Meteor.
 
 >>> add
 Add a package to this project.
-Usage: meteor add <package> [package..]
+Usage: meteor add [package..]
+       meteor add --search <query>
+       meteor add <url|user/repo> [--from-branch <branch>] [--from-dir <dir>] [--to <path>] [--force]
+       meteor add --from <url|user/repo> [--from-branch <branch>] [--from-dir <dir>] [--to <path>] [--force]
 
 Adds packages to your Meteor project. You can add multiple
-packages with one command. To query for available packages, use
-the meteor search command.
+packages with one command.
+
+Run without any package names to open an interactive search
+against the Atmosphere community package directory. With no query
+typed the picker shows two starter sections: a Core recommended
+list followed by the top 10 community-maintained packages from
+Atmosphere (deduped). Type to search, press <space> to toggle, ? on
+a row for details, and <enter> to install. Results are reordered to
+favor packages updated within the last 24 months.
+Use `meteor add --search <query>` to jump straight to results for
+a given query. Both forms require an interactive terminal.
 
 Optional version constraints can be added. Running `meteor add package@1.1.0`
 will add the package at version 1.1.0 or higher (but not 2.0.0 or higher).
@@ -268,22 +312,52 @@ To remove a version constraint for a specific package, run "meteor add" command
 again without specifying a version. For example above, to stop using
 version 1.1.0 exactly, run `meteor add package`.
 
+You can clone a package from a Git repository by passing the source URL as the
+only package argument, or by passing it explicitly with --from. Meteor places it
+as a local package in your project. The cloned directory must contain a valid
+package.js file. The package name is read from Package.describe and registered
+in .meteor/packages automatically.
+
 Options:
+  --search <query>              Open an interactive Atmosphere package search
+                                pre-populated with the given query. Incompatible
+                                with positional package names and Git options.
   --allow-incompatible-update   Allow packages in your project to be upgraded or
                    downgraded to versions that are potentially incompatible with
                    the current versions, if required to satisfy all package
                    version constraints.
 
+Git options:
+  --from           Clone a package from a Git URL or GitHub shorthand (user/repo).
+                   Optional when the only package argument is URL-like.
+  --from-branch    Branch to clone from.
+  --from-dir       Extract only a subdirectory from the repo.
+  --to             Destination path relative to project root. By default, Meteor
+                   uses packages/<dir-name> when --from-dir is set or when a
+                   tree/.../<dir> URL parses into fromDir, otherwise
+                   packages/<repo-name>.
+  --force          Overwrite destination directory if it already exists.
+
 
 >>> remove
 Remove a package from this project.
-Usage: meteor remove <package> [package..]
+Usage: meteor remove [package..]
+       meteor remove --search <query>
 
 Removes a package previously added to your Meteor project. For a
 list of the packages that your application is currently using, see
 'meteor list'.
 
+Run without any package names to open an interactive picker listing
+the packages currently in `.meteor/packages`. Type to filter, press
+<space> to toggle, ? on a row to see its details, and <enter> to
+confirm. Use `meteor remove --search <query>` to open the picker
+pre-filtered. Both forms require an interactive terminal.
+
 Options:
+  --search <query>              Open an interactive picker pre-filtered by the
+                                given query. Incompatible with positional
+                                package names.
   --allow-incompatible-update   Allow packages in your project to be upgraded or
                    downgraded to versions that are potentially incompatible with
                    the current versions, if required to satisfy all package
@@ -430,6 +504,22 @@ Options:
 
 
 
+>>> types
+Generate package type declarations for this project.
+Usage: meteor types
+
+Build local packages and generate `.meteor/types/` for projects that
+have a `tsconfig.json` or `jsconfig.json`. This command skips linting and
+bundling, which makes it useful for CI workflows that only need generated
+Meteor package declarations before running `tsc`.
+
+Options:
+  --allow-incompatible-update   Allow packages in your project to be upgraded or
+                      downgraded to versions that are potentially incompatible
+                      with the current versions, if required to satisfy all
+                      package version constraints.
+
+
 >>> lint
 Build this project and run the linters printing all errors and warnings.
 Usage: meteor lint
@@ -473,14 +563,18 @@ commands can be accessed by pressing the up arrow.
 Connect to the local Mongo database
 Usage: meteor mongo [--url]
 
-Opens a Mongo shell to view or manipulate collections.
+Opens a Mongo shell(mongosh) to view or manipulate collections.
 
 Instead of opening a shell, specifying --url (-U) will return a URL
 suitable for an external program to connect to the database. For remote
 databases on deployed applications, the URL is valid for one hour.
 
+Note that you must have mongosh installed to use this option.
+
 Options:
   --url, -U return a Mongo database URL
+  --verbose, -v to show the errors that have occurred while connecting to the
+                database
 
 Currently, this feature can only be used when developing locally.
 The opened Mongo shell connects to the current project's local
@@ -488,11 +582,12 @@ development database. The current working directory must be a Meteor
 project directory, and the Meteor application must already be running.
 
 >>> reset
-Reset the project state. Erases the local database.
-Usage: meteor reset
+Reset the project state.
+Usage: meteor reset [--db]
 
-Reset the current project to a fresh state. Removes all local data.
+Reset the current project to a fresh state and clear the local cache.
 
+The --db flag also removes the local database.
 
 >>> deploy
 Deploy this project to Galaxy, Meteor's hosting service.
@@ -516,6 +611,12 @@ unset Meteor.settings, pass an empty settings file.
 
 The --delete flag permanently removes a deployed application, including
 all of its stored data.
+
+Meteor finds the Galaxy region of a site over HTTPS, or over HTTP when the site
+has no certificate yet, and only accepts deploy servers under
+galaxy-deploy.meteor.com. To use a specific region or
+another deploy server, set the DEPLOY_HOSTNAME environment variable, for example
+`DEPLOY_HOSTNAME=eu-west-1.galaxy-deploy.meteor.com meteor deploy <site>`.
 
 Options:
   --delete, -D    permanently delete this deployment
@@ -541,6 +642,9 @@ Options:
                   ('galaxy.meteor.com'.env.MONGO_URL), when deploying, Galaxy will create
                   a database to your app in its shared cluster and will insert the URL in
                   your app's settings for you.
+  --container-size         With the argument `--container-size` you can change your app's
+                  container size using the deploy command. The valid arguments are: tiny,
+                  compact, standard, double, quad, octa, and dozen.
 
 >>> authorized
 View or change authorized users and organizations for a site.
@@ -623,6 +727,7 @@ with --port.
 Options:
   --port, -p        Port to listen on (instead of the default 3000). Also
                     uses port N+1 and N+2.
+  --open, -o        Opens a browser window when the app starts.
   --inspect[-brk][=<port>]
                     Enable server-side debugging via debugging clients like
                     the Node.js command-line debugger, Chrome DevTools, or
@@ -712,6 +817,7 @@ Meteor Guide - https://guide.meteor.com/testing.html
 Options:
   --port, -p        Port to listen on (instead of the default 3000). Also
                     uses port N+1 and N+2.
+  --open, -o        Opens a browser window when the app starts.
   --inspect[-brk][=<port>]
                     Enable server-side debugging via debugging clients like
                     the Node.js command-line debugger, Chrome DevTools, or
@@ -729,7 +835,9 @@ Options:
                     important when multiple Cordova apps are build from the same
                     Meteor app source code as by default the port is generated
                     using the id inside .meteor/.id file.
-  --raw-logs        Run without parsing logs from stdout and stderr.
+  --raw-logs        Run without parsing logs from stdout and stderr (default: true).
+  --timestamps      Run with timestamps in logs, the same as passing `--raw-logs=false`.
+
   --settings, -s    Set optional data for Meteor.settings on the server
 
   --ios,            Run tests in an emulator or on a mobile device. All of
@@ -748,6 +856,7 @@ Options:
   --exclude-archs   Don't create test bundles for certain web architectures
                     (comma separated, for example:
                     --exclude-archs "web.browser.legacy, web.cordova")
+  --open            Opens a browser window when it finishes building
 
 >>> self-test
 Run tests of the 'meteor' tool.
@@ -797,7 +906,16 @@ Usage: meteor admin <command> [args]
 Rarely used commands for administering official Meteor services.
 
 Commands:
-{{commands}}
+
+  make-bootstrap-tarballs
+  recommend-release
+  change-homepage
+  set-unmigrated
+  set-banners
+  list-organizations
+  members
+  set-latest-readme
+  get-machine
 
 See 'meteor help admin <command>' for details on an admin command.
 
@@ -834,6 +952,34 @@ for which other users have authorized you with the 'meteor authorized'
 command. To see sites in a region other than us-east-1, set the DEPLOY_HOSTNAME
 environment variable. For example,
 `DEPLOY_HOSTNAME=eu-west-1.galaxy-deploy.meteor.com meteor list-sites`
+
+>>> generate
+
+Generate boilerplate code for a MeteorJS RPC api.
+It generates a collection with the name you pass and its methods.
+Is JS and TS compatible. No collection name
+runs the wizard.
+
+Usage: meteor generate [<collectionName>] [options]
+
+By default, generates a collection.ts|js file with the name you pass,
+methods(insert, update, remove, find, findOne) in a methods.js|ts file
+and publications.js|ts. If you just use the command without collectionName,
+it will generate run the wizard, asking you what is necessary.
+
+We do have as well the templatePath, wich uses the template you pass to generate
+the boilerplate code. You can use the default template or create your own.
+for replacing the names, we offer $$PascalName$$, $$camelName$$, $$name$$.
+
+This is a MeteorJS project command.
+
+Options:
+  --help          	Show help.
+  --path          	The path to the folder where the files will be generated. Default is the current folder.
+  --templatePath  	Path to the template file check https://docs.meteor.com/commandline.html#meteorgenerate-templating for more info.
+  --replaceFn		 	  Replace function to replace the names in the template. Check https://docs.meteor.com/commandline.html#meteorgenerate-templating for more info.
+  --methods       	Generate methods.
+  --publications  	Generate publications.
 
 
 >>> publish-release
@@ -902,6 +1048,10 @@ Options:
              constraints.
   --no-lint  don't run linters on the published package and its local
              dependencies before publishing
+  --release <version> Specify the release of Meteor to resolve top-level version
+             conflicts. This option is particularly useful during the migration
+             process when dealing with packages that have conflicting version
+             requirements.
 
 
 >>> publish-for-arch
@@ -978,6 +1128,10 @@ Use <name>@<version> to get more information about a specific version of a
 package or release. Use '<name>@local' to see information from a
 local version. Running from a package source directory with no arguments will
 show information for that package version.
+
+The name for meteor release information is METEOR.
+
+  meteor show METEOR - will show all recommended meteor releases
 
 By default, Meteor will not show more than five versions, and will not
 show experimental release versions. Meteor will also hide packages that
@@ -1100,3 +1254,51 @@ To see the requirements for this compilation step, consult the
 platform requirements for 'node-gyp':
 
   https://github.com/nodejs/node-gyp
+
+>>> profile
+Run performance profiling for the Meteor application.
+Usage: meteor profile [<meteor-run-options>...]
+
+This command runs a performance profile for the Meteor application, monitoring the
+bundler process and tracking key performance metrics to help analyze the build and
+bundling performance.
+
+Use METEOR_IDLE_TIMEOUT=<seconds> to set a timeout for profiling. The default time (90s)
+is usually enough for each build step to complete. If you encounter errors due to
+early exits, adjust the environment variable accordingly.
+
+Use METEOR_CLIENT_ENTRYPOINT=<path-to-file> to set a custom client entrypoint, and
+METEOR_SERVER_ENTRYPOINT=<path-to-file> to set a custom server entrypoint. By default,
+it uses the server and client entrypoints specified in your package.json.
+
+Use METEOR_LOG_DIR=<path-to-directory> to set a custom log directory.
+
+Options:
+  --size         monitor both bundle runtime and size
+  --size-only    monitor only the bundle size
+  --build        monitor build time
+
+The rest of options for this command are the same as those for the meteor run command.
+You can pass typical runtime options (such as --settings, --exclude-archs, etc.)
+to customize the profiling process.
+
+
+>>> shell-completion
+Install and configure tab completion for meteor commands.
+Usage: meteor shell-completion [options]
+
+Installs tab completion for the 'meteor' command to your shell profile
+(supporting Bash and Zsh on macOS and Linux).
+
+When installed, pressing tab will automatically autocomplete Meteor commands,
+options, platforms, and package names.
+
+The installed script embeds the current top-level command list. Re-run
+'meteor shell-completion --install' after updating your Meteor checkout to
+refresh that list.
+
+Options:
+  --install      Install completion to your shell profile configuration
+  --uninstall    Uninstall completion from your shell profile configuration
+  --script       Print the shell completion script to stdout
+  --shell        Specify the shell type (bash or zsh) for --install or --script

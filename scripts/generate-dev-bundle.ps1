@@ -185,9 +185,8 @@ Function Add-NodeAndNpm {
 
   # Let's install the npm version we really want.
   Write-Host "Installing npm@${NPM_VERSION}..." -ForegroundColor Magenta
-  & "$tempNpmCmd" install --prefix="$dirLib" --no-bin-links --save `
-    --cache="$dirNpmCache" --nodedir="$dirTempNode" npm@${NPM_VERSION} |
-      Write-Debug
+  Write-Host (& "$tempNpmCmd" install --prefix="$dirLib" --no-bin-links --save `
+      --cache="$dirNpmCache" --nodedir="$dirTempNode" npm@${NPM_VERSION} 2>&1)
 
   if ($LASTEXITCODE -ne 0) {
     throw "Couldn't install npm@${NPM_VERSION}."
@@ -253,8 +252,8 @@ Function Add-Mongo {
 
   Write-Host "Putting MongoDB mongod.exe in mongodb\bin" -ForegroundColor Magenta
   cp "$DIR\mongodb\$mongo_zip_name\bin\mongod.exe" $DIR\mongodb\bin
-  Write-Host "Putting MongoDB mongo.exe in mongodb\bin" -ForegroundColor Magenta
-  cp "$DIR\mongodb\$mongo_zip_name\bin\mongo.exe" $DIR\mongodb\bin
+  Write-Host "Putting MongoDB mongos.exe in mongodb\bin" -ForegroundColor Magenta
+  cp "$DIR\mongodb\$mongo_zip_name\bin\mongos.exe" $DIR\mongodb\bin
 
   Write-Host "Removing the old Mongo zip..." -ForegroundColor Magenta
   rm -Recurse -Force $mongo_zip
@@ -262,6 +261,29 @@ Function Add-Mongo {
   rm -Recurse -Force "$DIR\mongodb\$mongo_zip_name"
 
   cd "$previousCwd"
+}
+
+# Runs a native command printing its full output (stdout + stderr) to the
+# host and returns its exit code. Under the GitHub Actions PowerShell wrapper
+# ($ErrorActionPreference = 'Stop'), the first stderr line of a native command
+# becomes a terminating NativeCommandError: the script dies mid-command and
+# the rest of the output (the actual error detail) is lost. Routing the merged
+# stream through Write-Host avoids the conversion and keeps everything in the
+# CI log; failures are decided by exit code instead.
+Function Invoke-NativeCommandLoud {
+  Param (
+    [Parameter(Mandatory=$True, Position=0)]
+    [string]$Executable,
+    [Parameter(Position=1)]
+    [string[]]$Arguments = @()
+  )
+
+  $previousEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  & $Executable @Arguments 2>&1 | ForEach-Object { Write-Host "$_" }
+  $ErrorActionPreference = $previousEap
+
+  return $LASTEXITCODE
 }
 
 Function Add-NpmModulesFromJsBundleFile {
@@ -291,27 +313,20 @@ Function Add-NpmModulesFromJsBundleFile {
     Out-File -FilePath $(Join-Path $Destination 'package.json') -Encoding ascii
 
   # No bin-links because historically, they weren't used anyway.
-  & "$($Commands.npm)" install
-  if ($LASTEXITCODE -ne 0) {
-    throw "Couldn't install npm packages."
+  $npmExit = Invoke-NativeCommandLoud "$($Commands.npm)" @('install')
+  if ($npmExit -ne 0) {
+    throw "Couldn't install npm packages (npm exited with code $npmExit)."
   }
 
   # As of npm@5, this just renames `package-lock.json` to `npm-shrinkwrap.json`.
   if ($Shrinkwrap -eq $True) {
-    & "$($Commands.npm)" shrinkwrap
-    if ($LASTEXITCODE -ne 0) {
-      throw "Couldn't make shrinkwrap."
+    $npmExit = Invoke-NativeCommandLoud "$($Commands.npm)" @('shrinkwrap')
+    if ($npmExit -ne 0) {
+      throw "Couldn't make shrinkwrap (npm exited with code $npmExit)."
     }
   }
 
   cd node_modules
-
-  # Since we install a patched version of pacote in $Destination\lib\node_modules,
-  # we need to remove npm's bundled version to make it use the new one.
-  if (Test-Path "pacote") {
-    Remove-DirectoryRecursively "npm\node_modules\pacote"
-    & "$($Commands.node)" -e "require('fs').renameSync('pacote', 'npm\\node_modules\\pacote')"
-  }
 
   cd "$previousCwd"
 }
@@ -384,10 +399,6 @@ $npmToolArgs = @{
   commands = $toolCmds
 }
 Add-NpmModulesFromJsBundleFile @npmToolArgs
-
-# Leaving these probably doesn't hurt, but are removed for consistency w/ Unix.
-Remove-Item $(Join-Path $dirLib 'package.json')
-Remove-Item $(Join-Path $dirLib 'package-lock.json')
 
 Write-Host "Done writing node_modules build(s)..." -ForegroundColor Magenta
 

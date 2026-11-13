@@ -131,6 +131,30 @@ describe("@meteorjs/babel", () => {
              { line: 3, column: 12 });
   });
 
+  it("does not compile recursively while retrieving a source map", () => {
+    const babelRegister = require("../register.js");
+    const fixture = path.join(__dirname, "source-map-reentry.js");
+    const originalCompile = meteorBabel.compile;
+    let compileCalls = 0;
+
+    meteorBabel.compile = function (...args) {
+      compileCalls++;
+      if (compileCalls === 1) {
+        assert.strictEqual(babelRegister.retrieveSourceMap(fixture), null);
+      }
+      return originalCompile.apply(this, args);
+    };
+
+    try {
+      assert.strictEqual(require(fixture), "loaded");
+    } finally {
+      meteorBabel.compile = originalCompile;
+      delete require.cache[fixture];
+    }
+
+    assert.strictEqual(compileCalls, 1);
+  });
+
   it("should tolerate exported declarations named `module`", function () {
     const absId = require.resolve("d3/build/package.js");
     const source = readFileSync(absId, "utf8");
@@ -315,10 +339,9 @@ describe("@meteorjs/babel", () => {
       "  }",
       "});",
       "var Test;",
-      "",
       "(function (Test) {",
       "  Test.enabled = true;",
-      "})(Test || module.runSetters(Test = {}));",
+      "})(Test || module.runSetters(Test = {}, [\"Test\"]));",
     ].join("\n"));
   });
 
@@ -773,40 +796,6 @@ val = "zxcv";`;
     }
 
     assert.strictEqual(sum, limit * (limit + 1) / 2);
-  });
-
-  it("Promise.await", () => {
-    var markers = [];
-
-    async function f() {
-      markers.push("before");
-      if (require("fibers").current) {
-        assert.strictEqual(
-          Promise.await(Promise.resolve(1234)),
-          1234
-        );
-      } else {
-        assert.strictEqual(
-          await Promise.resolve(1234),
-          1234
-        );
-      }
-      markers.push("after");
-      return "done";
-    }
-
-    assert.deepEqual(markers, []);
-
-    var promise = f();
-
-    // The async function should execute synchronously up to the first
-    // Promise.await or await expression, but no further.
-    assert.deepEqual(markers, ["before"]);
-
-    return promise.then(result => {
-      assert.strictEqual(result, "done");
-      assert.deepEqual(markers, ["before", "after"]);
-    });
   });
 
   it("async arrow functions", async function () {

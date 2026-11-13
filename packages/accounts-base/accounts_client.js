@@ -1,5 +1,9 @@
 import {AccountsCommon} from "./accounts_common.js";
 
+// Five total attempts span the default ten-second cookie endpoint quota
+// window, while keeping startup recovery bounded.
+const COOKIE_LOGIN_RETRY_DELAYS = [250, 1000, 3000, 7000];
+
 /**
  * @summary Constructor for the `Accounts` object on the client.
  * @locus Client
@@ -9,6 +13,8 @@ import {AccountsCommon} from "./accounts_common.js";
  * @param {Object} options an object with fields:
  * @param {Object} options.connection Optional DDP connection to reuse.
  * @param {String} options.ddpUrl Optional URL for creating a new DDP connection.
+ * @param {'session' | 'local' | 'none'} options.clientStorage Optional Define what kind of storage you want for credentials on the client. Default is 'local' to use `localStorage`. Set to 'session' to use session storage. Use 'none' to avoid persisting tokens.
+ * @param {Boolean} options.useHttpOnlyCookies Optional Enable HttpOnly cookie flow for auth resume. When enabled, the client will try to refresh a login token from a server HttpOnly cookie during startup, and will sync the cookie after logins/logouts. The same option must also be enabled on the server, otherwise the cookie endpoints do not respond.
  */
 export class AccountsClient extends AccountsCommon {
   constructor(options) {
@@ -22,15 +28,63 @@ export class AccountsClient extends AccountsCommon {
 
     this._pageLoadLoginCallbacks = [];
     this._pageLoadLoginAttemptInfo = null;
+    this._cookieLoginAttempt = 0;
 
     this.savedHash = window.location.hash;
     this._initUrlMatching();
 
+    this.initStorageLocation(options);
+
+    // Read HttpOnly cookie setting from options or public settings
+    this._useHttpOnlyCookies = !!(options?.useHttpOnlyCookies || Meteor.settings?.public?.packages?.accounts?.useHttpOnlyCookies);
+
     // Defined in localstorage_token.js.
     this._initLocalStorage();
 
+    // Try to resume via HttpOnly cookie if enabled
+    this._initHttpOnlyCookieLogin();
+
     // This is for .registerClientLoginFunction & .callLoginFunction.
     this._loginFuncs = {};
+
+    // This tracks whether callbacks registered with
+    // Accounts.onLogin have been called
+    this._loginCallbacksCalled = false;
+  }
+
+  initStorageLocation(options) {
+    // Determine whether to use local or session storage to storage credentials and anything else.
+    const desired = options?.clientStorage || Meteor.settings?.public?.packages?.accounts?.clientStorage;
+    if (desired === 'session') {
+      this.storageLocation = window.sessionStorage;
+    } else if (desired === 'none') {
+      // In-memory, non-persistent storage shim
+      const mem = new Map();
+      this.storageLocation = {
+        getItem: (k) => mem.get(k) || null,
+        setItem: (k, v) => { mem.set(k, String(v)); },
+        removeItem: (k) => { mem.delete(k); },
+      };
+    } else {
+      this.storageLocation = Meteor._localStorage;
+    }
+  }
+
+  config(options) {
+    super.config(options);
+
+    this.initStorageLocation(options);
+    if (Object.prototype.hasOwnProperty.call(options || {}, 'useHttpOnlyCookies')) {
+      this._useHttpOnlyCookies = !!options.useHttpOnlyCookies;
+    }
+  }
+
+  _onUsersCollectionChanged() {
+    // Secondary Accounts instances must not replace the global users collection.
+    if (this === Accounts) {
+      Meteor.users = this.users;
+    }
+    super._onUsersCollectionChanged();
   }
 
   ///
@@ -114,18 +168,56 @@ export class AccountsClient extends AccountsCommon {
    * @param {Function} [callback] Optional callback. Called with no arguments on success, or with a single `Error` argument on failure.
    */
   logout(callback) {
+    this._cancelHttpOnlyCookieLogin();
     this._loggingOut.set(true);
-    this.connection.apply('logout', [], {
+
+    this.connection.applyAsync('logout', [], {
+      // TODO[FIBERS]: Look this { wait: true } later.
       wait: true
-    }, (error, result) => {
-      this._loggingOut.set(false);
-      if (error) {
-        callback && callback(error);
-      } else {
-        this.makeClientLoggedOut();
-        callback && callback();
-      }
-    });
+    })
+      .then(async (result) => {
+        this._loggingOut.set(false);
+        this._loginCallbacksCalled = false;
+        await this.makeClientLoggedOut();
+        callback?.();
+      })
+      .catch((e) => {
+        this._loggingOut.set(false);
+        callback?.(e);
+      });
+  }
+
+  logoutAsync() {
+    return Meteor.promisify(this.logout, this)();
+  }
+
+  /**
+   * @summary Log out all clients logged in as the current user and logs the current user out as well.
+   * @locus Client
+   * @param {Function} [callback] Optional callback. Called with no arguments on success, or with a single `Error` argument on failure.
+   */
+  logoutAllClients(callback) {
+    this._cancelHttpOnlyCookieLogin();
+    this._loggingOut.set(true);
+
+    this.connection.applyAsync('logoutAllClients', [], {
+      // TODO[FIBERS]: Look this { wait: true } later.
+      wait: true
+    })
+      .then(async (result) => {
+        this._loggingOut.set(false);
+        this._loginCallbacksCalled = false;
+        await this.makeClientLoggedOut();
+        callback?.();
+      })
+      .catch((e) => {
+        this._loggingOut.set(false);
+        callback?.(e);
+      });
+  }
+
+  logoutAllClientsAsync() {
+    return Meteor.promisify(this.logoutAllClients, this)();
   }
 
   /**
@@ -169,8 +261,12 @@ export class AccountsClient extends AccountsCommon {
       'removeOtherTokens',
       [],
       { wait: true },
-      err => callback && callback(err)
+      err => callback?.(err)
     );
+  }
+
+  logoutOtherClientsAsync() {
+    return Meteor.promisify(this.logoutOtherClients, this)();
   }
 
   ///
@@ -202,39 +298,49 @@ export class AccountsClient extends AccountsCommon {
   //                 logged in, or with the error on error.
   //
   callLoginMethod(options) {
-    options = { 
+    options = {
       methodName: 'login',
       methodArguments: [{}],
       _suppressLoggingIn: false,
       ...options,
     };
 
+    // Cancel startup recovery before an independent login enters the DDP
+    // queue. Waiting for that login to succeed can let a cookie resume queue
+    // behind it and restore the previous user. The cookie flow keeps its
+    // attempt so its failure callback can still clean up the session.
+    if (options._cookieLoginAttempt === undefined) {
+      this._cancelHttpOnlyCookieLogin();
+    }
+
     // Set defaults for callback arguments to no-op functions; make sure we
     // override falsey values too.
     ['validateResult', 'userCallback'].forEach(f => {
       if (!options[f])
         options[f] = () => null;
-    })
+    });
 
-    // Prepare callbacks: user provided and onLogin/onLoginFailure hooks.
     let called;
-    const loginCallbacks = ({ error, loginDetails }) => {
+    // Prepare callbacks: user provided and onLogin/onLoginFailure hooks.
+    const loginCallbacks = async ({ error, loginDetails }) => {
       if (!called) {
         called = true;
         if (!error) {
-          this._onLoginHook.each(callback => {
-            callback(loginDetails);
+          await this._onLoginHook.forEachAsync(async callback => {
+            await callback(loginDetails);
             return true;
           });
+          this._loginCallbacksCalled = true;
         } else {
-          this._onLoginFailureHook.each(callback => {
-            callback({ error });
+          this._loginCallbacksCalled = false;
+          await this._onLoginFailureHook.forEachAsync(async callback => {
+            await callback({ error });
             return true;
           });
         }
-        options.userCallback(error, loginDetails);
+        await options.userCallback(error, loginDetails);
       }
-    }
+    };
 
     let reconnected = false;
 
@@ -265,7 +371,7 @@ export class AccountsClient extends AccountsCommon {
           this._reconnectStopper.stop();
         }
 
-        this._reconnectStopper = DDP.onReconnect(conn => {
+        this._reconnectStopper = DDP.onReconnect(async conn => {
           if (conn != this.connection) {
             return;
           }
@@ -281,15 +387,17 @@ export class AccountsClient extends AccountsCommon {
           if (!result.tokenExpires)
             result.tokenExpires = this._tokenExpiration(new Date());
           if (this._tokenExpiresSoon(result.tokenExpires)) {
-            this.makeClientLoggedOut();
+            await this.makeClientLoggedOut();
           } else {
             this.callLoginMethod({
               methodArguments: [{resume: result.token}],
+              // This is still the same login attempt, not a competing login.
+              _cookieLoginAttempt: options._cookieLoginAttempt,
               // Reconnect quiescence ensures that the user doesn't see an
               // intermediate state before the login method finishes. So we don't
               // need to show a logging-in animation.
               _suppressLoggingIn: true,
-              userCallback: (error, loginDetails) => {
+              userCallback: async (error, loginDetails) => {
                 const storedTokenNow = this._storedLoginToken();
                 if (error) {
                   // If we had a login error AND the current stored token is the
@@ -310,13 +418,13 @@ export class AccountsClient extends AccountsCommon {
                   // periodic localStorage poll will call `makeClientLoggedOut`
                   // eventually if another tab wiped the token from storage.
                   if (storedTokenNow && storedTokenNow === result.token) {
-                    this.makeClientLoggedOut();
+                    await this.makeClientLoggedOut();
                   }
                 }
                 // Possibly a weird callback to call, but better than nothing if
                 // there is a reconnect between "login result received" and "data
                 // ready".
-                loginCallbacks({ error, loginDetails });
+                await loginCallbacks({ error, loginDetails });
               }});
           }
         });
@@ -326,7 +434,7 @@ export class AccountsClient extends AccountsCommon {
     // This callback is called once the local cache of the current-user
     // subscription (and all subscriptions, in fact) are guaranteed to be up to
     // date.
-    const loggedInAndDataReadyCallback = (error, result) => {
+    const loggedInAndDataReadyCallback = async (error, result) => {
       // If the login method returns its result but the connection is lost
       // before the data is in the local cache, it'll set an onReconnect (see
       // above). The onReconnect will try to log in using the token, and *it*
@@ -338,52 +446,94 @@ export class AccountsClient extends AccountsCommon {
       // Note that we need to call this even if _suppressLoggingIn is true,
       // because it could be matching a _setLoggingIn(true) from a
       // half-completed pre-reconnect login method.
-      this._setLoggingIn(false);
       if (error || !result) {
         error = error || new Error(
           `No result from call to ${options.methodName}`
         );
-        loginCallbacks({ error });
+        this._setLoggingIn(false);
+        await loginCallbacks({ error });
         return;
       }
       try {
         options.validateResult(result);
       } catch (e) {
-        loginCallbacks({ error: e });
+        this._setLoggingIn(false);
+        await loginCallbacks({ error: e });
         return;
       }
 
       // Make the client logged in. (The user data should already be loaded!)
-      this.makeClientLoggedIn(result.id, result.token, result.tokenExpires);
-      loginCallbacks({ loginDetails: { type: result.type } });
+      // When HttpOnly cookies are enabled, wait for the cookie sync before
+      // resolving login completion so downstream auth fetches can rely on it.
+      await this.makeClientLoggedIn(result.id, result.token, result.tokenExpires);
+
+      // use Tracker to make we sure have a user before calling the callbacks
+      Tracker.autorun(async (computation) => {
+        const user = await Tracker.withComputation(computation, () =>
+          Meteor.userAsync(),
+        );
+
+        if (user) {
+          // Flip before awaiting userCallback so the caller observes
+          // loggingIn() === false on the microtask after their await.
+          this._setLoggingIn(false);
+          try {
+            await loginCallbacks({ loginDetails: result });
+          } finally {
+            computation.stop();
+          }
+        }
+      });
+
     };
 
     if (!options._suppressLoggingIn) {
       this._setLoggingIn(true);
     }
-    this.connection.apply(
+    this.connection.applyAsync(
       options.methodName,
       options.methodArguments,
-      { wait: true, onResultReceived: onResultReceived },
+      { wait: true, onResultReceived },
       loggedInAndDataReadyCallback);
   }
 
-  makeClientLoggedOut() {
-    // Ensure client was successfully logged in before running logout hooks.
-    if (this.connection._userId) {
-      this._onLogoutHook.each(callback => {
-        callback();
-        return true;
-      });
+  async makeClientLoggedOut() {
+    this._cancelHttpOnlyCookieLogin();
+    let hookError;
+
+    try {
+      // Ensure client was successfully logged in before running logout hooks.
+      if (this.connection._userId) {
+        await this._onLogoutHook.forEachAsync(async callback => {
+          await callback();
+          return true;
+        });
+      }
+    } catch (error) {
+      hookError = error;
+    } finally {
+      this._unstoreLoginToken();
+      this.connection.setUserId(null);
+      this._reconnectStopper && this._reconnectStopper.stop();
+      // Clear HttpOnly cookie if enabled.
+      if (this._useHttpOnlyCookies) {
+        await this._clearHttpOnlyCookie();
+      }
     }
-    this._unstoreLoginToken();
-    this.connection.setUserId(null);
-    this._reconnectStopper && this._reconnectStopper.stop();
+
+    if (hookError) {
+      throw hookError;
+    }
   }
-  
-  makeClientLoggedIn(userId, token, tokenExpires) {
+
+  async makeClientLoggedIn(userId, token, tokenExpires) {
+    this._cancelHttpOnlyCookieLogin();
     this._storeLoginToken(userId, token, tokenExpires);
     this.connection.setUserId(userId);
+    // Sync HttpOnly cookie if enabled
+    if (this._useHttpOnlyCookies) {
+      await this._setHttpOnlyCookie(token);
+    }
   }
 
   ///
@@ -443,7 +593,7 @@ export class AccountsClient extends AccountsCommon {
   // before callbacks are registered see #10157
   _startupCallback(callback) {
     // Are we already logged in?
-    if (this.connection._userId) {
+    if (this._loginCallbacksCalled) {
       // If already logged in before handler is registered, it's safe to
       // assume type is a 'resume', so we execute the callback at the end
       // of the queue so that Meteor.startup can complete before any
@@ -470,6 +620,70 @@ export class AccountsClient extends AccountsCommon {
     });
   };
 
+  loginWithTokenAsync(token) {
+    return Meteor.promisify(this.loginWithToken, this)(token);
+  };
+
+  // Attempt startup login using an HttpOnly cookie by requesting the resume
+  // token into memory from the server.
+  async loginWithCookie() {
+    const attempt = ++this._cookieLoginAttempt;
+
+    for (let retry = 0; ; retry += 1) {
+      let res;
+      try {
+        res = await fetch('/_accounts/cookie/refresh', {
+          method: 'GET',
+          mode: 'same-origin',
+          credentials: 'include',
+          headers: { Accept: 'application/json' },
+        });
+      } catch (_e) {
+        if (!await this._waitForCookieLoginRetry(attempt, retry)) return;
+        continue;
+      }
+
+      if (attempt !== this._cookieLoginAttempt) return;
+      if (res.status === 429 || res.status >= 500) {
+        if (!await this._waitForCookieLoginRetry(attempt, retry)) return;
+        continue;
+      }
+      if (!res.ok || res.status === 204) return;
+
+      let body;
+      try {
+        body = await res.json();
+      } catch (_e) {
+        return;
+      }
+      if (!body?.token || attempt !== this._cookieLoginAttempt) return;
+
+      this.callLoginMethod({
+        methodArguments: [{ resume: body.token }],
+        _cookieLoginAttempt: attempt,
+        userCallback: async (err) => {
+          if (err && attempt === this._cookieLoginAttempt) {
+            await this.makeClientLoggedOut();
+          }
+        },
+      });
+      return;
+    }
+  };
+
+  _cancelHttpOnlyCookieLogin() {
+    this._cookieLoginAttempt += 1;
+  }
+
+  async _waitForCookieLoginRetry(attempt, retry) {
+    const delay = COOKIE_LOGIN_RETRY_DELAYS[retry];
+    if (delay === undefined || attempt !== this._cookieLoginAttempt) {
+      return false;
+    }
+    await new Promise(resolve => Meteor.setTimeout(resolve, delay));
+    return attempt === this._cookieLoginAttempt;
+  }
+
   // Semi-internal API. Call this function to re-enable auto login after
   // if it was disabled at startup.
   _enableAutoLogin() {
@@ -490,11 +704,11 @@ export class AccountsClient extends AccountsCommon {
   };
 
   _storeLoginToken(userId, token, tokenExpires) {
-    Meteor._localStorage.setItem(this.USER_ID_KEY, userId);
-    Meteor._localStorage.setItem(this.LOGIN_TOKEN_KEY, token);
+    this.storageLocation.setItem(this.USER_ID_KEY, userId);
+    this.storageLocation.setItem(this.LOGIN_TOKEN_KEY, token);
     if (! tokenExpires)
       tokenExpires = this._tokenExpiration(new Date());
-    Meteor._localStorage.setItem(this.LOGIN_TOKEN_EXPIRES_KEY, tokenExpires);
+    this.storageLocation.setItem(this.LOGIN_TOKEN_EXPIRES_KEY, tokenExpires);
 
     // to ensure that the localstorage poller doesn't end up trying to
     // connect a second time
@@ -502,27 +716,49 @@ export class AccountsClient extends AccountsCommon {
   };
 
   _unstoreLoginToken() {
-    Meteor._localStorage.removeItem(this.USER_ID_KEY);
-    Meteor._localStorage.removeItem(this.LOGIN_TOKEN_KEY);
-    Meteor._localStorage.removeItem(this.LOGIN_TOKEN_EXPIRES_KEY);
+    this.storageLocation.removeItem(this.USER_ID_KEY);
+    this.storageLocation.removeItem(this.LOGIN_TOKEN_KEY);
+    this.storageLocation.removeItem(this.LOGIN_TOKEN_EXPIRES_KEY);
 
     // to ensure that the localstorage poller doesn't end up trying to
     // connect a second time
     this._lastLoginTokenWhenPolled = null;
   };
 
+  async _setHttpOnlyCookie(token) {
+    try {
+      await fetch('/_accounts/cookie/set', {
+        method: 'POST',
+        mode: 'same-origin',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+    } catch (_e) {}
+  }
+
+  async _clearHttpOnlyCookie() {
+    try {
+      await fetch('/_accounts/cookie/clear', {
+        method: 'POST',
+        mode: 'same-origin',
+        credentials: 'include'
+      });
+    } catch (_e) {}
+  }
+
   // This is private, but it is exported for now because it is used by a
   // test in accounts-password.
   _storedLoginToken() {
-    return Meteor._localStorage.getItem(this.LOGIN_TOKEN_KEY);
+    return this.storageLocation.getItem(this.LOGIN_TOKEN_KEY);
   };
 
   _storedLoginTokenExpires() {
-    return Meteor._localStorage.getItem(this.LOGIN_TOKEN_EXPIRES_KEY);
+    return this.storageLocation.getItem(this.LOGIN_TOKEN_EXPIRES_KEY);
   };
 
   _storedUserId() {
-    return Meteor._localStorage.getItem(this.USER_ID_KEY);
+    return this.storageLocation.getItem(this.USER_ID_KEY);
   };
 
   _unstoreLoginTokenIfExpiresSoon() {
@@ -570,10 +806,10 @@ export class AccountsClient extends AccountsCommon {
         // request is in flight. This reduces page flicker on startup.
         const userId = this._storedUserId();
         userId && this.connection.setUserId(userId);
-        this.loginWithToken(token, err => {
+        this.loginWithToken(token, async err => {
           if (err) {
             Meteor._debug(`Error logging in with token: ${err}`);
-            this.makeClientLoggedOut();
+            await this.makeClientLoggedOut();
           }
 
           this._pageLoadLogin({
@@ -605,6 +841,15 @@ export class AccountsClient extends AccountsCommon {
     }, 3000);
   };
 
+  _initHttpOnlyCookieLogin() {
+    if (!this._useHttpOnlyCookies) return;
+    // Only attempt cookie resume if we didn't find a local token
+    const hasLocalToken = !!this._storedLoginToken();
+    if (!hasLocalToken) {
+      this.loginWithCookie();
+    }
+  }
+
   _pollStoredLoginToken() {
     if (! this._autoLoginEnabled) {
       return;
@@ -615,9 +860,9 @@ export class AccountsClient extends AccountsCommon {
     // != instead of !== just to make sure undefined and null are treated the same
     if (this._lastLoginTokenWhenPolled != currentLoginToken) {
       if (currentLoginToken) {
-        this.loginWithToken(currentLoginToken, (err) => {
+        this.loginWithToken(currentLoginToken, async (err) => {
           if (err) {
-            this.makeClientLoggedOut();
+            await this.makeClientLoggedOut();
           }
         });
       } else {
@@ -635,23 +880,39 @@ export class AccountsClient extends AccountsCommon {
   _initUrlMatching() {
     // By default, allow the autologin process to happen.
     this._autoLoginEnabled = true;
-  
+
     // We only support one callback per URL.
     this._accountsCallbacks = {};
-  
+
     // Try to match the saved value of window.location.hash.
     this._attemptToMatchHash();
   };
-  
+
   // Separate out this functionality for testing
   _attemptToMatchHash() {
     attemptToMatchHash(this, this.savedHash, defaultSuccessHandler);
   };
 
   /**
+   * @summary Shared implementation for registering account link callbacks.
+   * @param {String} type The callback type (e.g. 'reset-password', 'verify-email', 'enroll-account').
+   * @param {Function} callback The function to call when the link is clicked.
+   * @locus Client
+   */
+  _registerLinkCallback(type, callback) {
+    if (this._accountsCallbacks[type]) {
+      Meteor._debug(
+        `Accounts callback for "${type}" was registered more than once. ` +
+        "Only one callback added will be executed."
+      );
+    }
+    this._accountsCallbacks[type] = callback;
+  };
+
+  /**
    * @summary Register a function to call when a reset password link is clicked
    * in an email sent by
-   * [`Accounts.sendResetPasswordEmail`](#accounts_sendresetpasswordemail).
+   * [`Accounts.sendResetPasswordEmail`](#Accounts-sendResetPasswordEmail).
    * This function should be called in top-level code, not inside
    * `Meteor.startup()`.
    * @memberof! Accounts
@@ -659,25 +920,20 @@ export class AccountsClient extends AccountsCommon {
    * @param  {Function} callback The function to call. It is given two arguments:
    *
    * 1. `token`: A password reset token that can be passed to
-   * [`Accounts.resetPassword`](#accounts_resetpassword).
+   * [`Accounts.resetPassword`](#Accounts-resetPassword).
    * 2. `done`: A function to call when the password reset UI flow is complete. The normal
    * login process is suspended until this function is called, so that the
    * password for user A can be reset even if user B was logged in.
    * @locus Client
    */
   onResetPasswordLink(callback) {
-    if (this._accountsCallbacks["reset-password"]) {
-      Meteor._debug("Accounts.onResetPasswordLink was called more than once. " +
-        "Only one callback added will be executed.");
-    }
-
-    this._accountsCallbacks["reset-password"] = callback;
+    this._registerLinkCallback("reset-password", callback);
   };
 
   /**
    * @summary Register a function to call when an email verification link is
    * clicked in an email sent by
-   * [`Accounts.sendVerificationEmail`](#accounts_sendverificationemail).
+   * [`Accounts.sendVerificationEmail`](#Accounts-sendVerificationEmail).
    * This function should be called in top-level code, not inside
    * `Meteor.startup()`.
    * @memberof! Accounts
@@ -685,7 +941,7 @@ export class AccountsClient extends AccountsCommon {
    * @param  {Function} callback The function to call. It is given two arguments:
    *
    * 1. `token`: An email verification token that can be passed to
-   * [`Accounts.verifyEmail`](#accounts_verifyemail).
+   * [`Accounts.verifyEmail`](#Accounts-verifyEmail).
    * 2. `done`: A function to call when the email verification UI flow is complete.
    * The normal login process is suspended until this function is called, so
    * that the user can be notified that they are verifying their email before
@@ -693,18 +949,13 @@ export class AccountsClient extends AccountsCommon {
    * @locus Client
    */
   onEmailVerificationLink(callback) {
-    if (this._accountsCallbacks["verify-email"]) {
-      Meteor._debug("Accounts.onEmailVerificationLink was called more than once. " +
-        "Only one callback added will be executed.");
-    }
-
-    this._accountsCallbacks["verify-email"] = callback;
+    this._registerLinkCallback("verify-email", callback);
   };
 
   /**
    * @summary Register a function to call when an account enrollment link is
    * clicked in an email sent by
-   * [`Accounts.sendEnrollmentEmail`](#accounts_sendenrollmentemail).
+   * [`Accounts.sendEnrollmentEmail`](#Accounts-sendEnrollmentEmail).
    * This function should be called in top-level code, not inside
    * `Meteor.startup()`.
    * @memberof! Accounts
@@ -712,7 +963,7 @@ export class AccountsClient extends AccountsCommon {
    * @param  {Function} callback The function to call. It is given two arguments:
    *
    * 1. `token`: A password reset token that can be passed to
-   * [`Accounts.resetPassword`](#accounts_resetpassword) to give the newly
+   * [`Accounts.resetPassword`](#Accounts-resetPassword) to give the newly
    * enrolled account a password.
    * 2. `done`: A function to call when the enrollment UI flow is complete.
    * The normal login process is suspended until this function is called, so that
@@ -720,19 +971,14 @@ export class AccountsClient extends AccountsCommon {
    * @locus Client
    */
   onEnrollmentLink(callback) {
-    if (this._accountsCallbacks["enroll-account"]) {
-      Meteor._debug("Accounts.onEnrollmentLink was called more than once. " +
-        "Only one callback added will be executed.");
-    }
-
-    this._accountsCallbacks["enroll-account"] = callback;
+    this._registerLinkCallback("enroll-account", callback);
   };
 
-};
+}
 
 /**
- * @summary True if a login method (such as `Meteor.loginWithPassword`, 
- * `Meteor.loginWithFacebook`, or `Accounts.createUser`) is currently in 
+ * @summary True if a login method (such as `Meteor.loginWithPassword`,
+ * `Meteor.loginWithFacebook`, or `Accounts.createUser`) is currently in
  * progress. A reactive data source.
  * @locus Client
  * @importFromPackage meteor
@@ -740,7 +986,7 @@ export class AccountsClient extends AccountsCommon {
 Meteor.loggingIn = () => Accounts.loggingIn();
 
 /**
- * @summary True if a logout method (such as `Meteor.logout`) is currently in 
+ * @summary True if a logout method (such as `Meteor.logout`) is currently in
  * progress. A reactive data source.
  * @locus Client
  * @importFromPackage meteor
@@ -756,6 +1002,30 @@ Meteor.loggingOut = () => Accounts.loggingOut();
 Meteor.logout = callback => Accounts.logout(callback);
 
 /**
+ * @summary Log the user out. Returns a Promise.
+ * @locus Client
+ * @returns {Promise<void>} Resolves on success, rejects with error on failure.
+ * @importFromPackage meteor
+ */
+Meteor.logoutAsync = () => Accounts.logoutAsync();
+
+/**
+ * @summary Log out all clients logged in as the current user and logs the current user out as well.
+ * @locus Client
+ * @param {Function} [callback] Optional callback. Called with no arguments on success, or with a single `Error` argument on failure.
+ * @importFromPackage meteor
+ */
+Meteor.logoutAllClients = callback => Accounts.logoutAllClients(callback);
+
+/**
+ * @summary Log out all clients logged in as the current user and logs the current user out as well. Returns a Promise.
+ * @locus Client
+ * @returns {Promise<void>} Resolves on success, rejects with error on failure.
+ * @importFromPackage meteor
+ */
+Meteor.logoutAllClientsAsync = () => Accounts.logoutAllClientsAsync();
+
+/**
  * @summary Log out other clients logged in as the current user, but does not log out the client that calls this function.
  * @locus Client
  * @param {Function} [callback] Optional callback. Called with no arguments on success, or with a single `Error` argument on failure.
@@ -764,16 +1034,35 @@ Meteor.logout = callback => Accounts.logout(callback);
 Meteor.logoutOtherClients = callback => Accounts.logoutOtherClients(callback);
 
 /**
+ * @summary Log out other clients logged in as the current user, but does not log out the client that calls this function. Returns a Promise.
+ * @locus Client
+ * @returns {Promise<void>} Resolves on success, rejects with error on failure.
+ * @importFromPackage meteor
+ */
+Meteor.logoutOtherClientsAsync = () => Accounts.logoutOtherClientsAsync();
+
+/**
  * @summary Login with a Meteor access token.
  * @locus Client
- * @param {Object} [token] Local storage token for use with login across 
+ * @param {String} token Local storage token for use with login across
  * multiple tabs in the same browser.
  * @param {Function} [callback] Optional callback. Called with no arguments on
- * success.
+ * success, or with a single `Error` argument on failure.
  * @importFromPackage meteor
  */
 Meteor.loginWithToken = (token, callback) =>
   Accounts.loginWithToken(token, callback);
+
+/**
+ * @summary Login with a Meteor access token. Returns a Promise.
+ * @locus Client
+ * @param {String} token Local storage token for use with login across
+ * multiple tabs in the same browser.
+ * @returns {Promise<Object>} Resolves with login details on success, rejects with error on failure.
+ * @importFromPackage meteor
+ */
+Meteor.loginWithTokenAsync = (token) =>
+  Accounts.loginWithTokenAsync(token);
 
 ///
 /// HANDLEBARS HELPERS
@@ -791,6 +1080,11 @@ if (Package.blaze) {
    * @summary Calls [Meteor.user()](#meteor_user). Use `{{#if currentUser}}` to check whether the user is logged in.
    */
   Template.registerHelper('currentUser', () => Meteor.user());
+
+  // TODO: the code above needs to be changed to Meteor.userAsync() when we have
+  // a way to make it reactive using async.
+  // Template.registerHelper('currentUserAsync',
+  //  async () => await Meteor.userAsync());
 
   /**
    * @global
@@ -815,7 +1109,7 @@ if (Package.blaze) {
    * @summary Calls [Meteor.loggingIn()](#meteor_loggingin) or [Meteor.loggingOut()](#meteor_loggingout).
    */
   Template.registerHelper(
-    'loggingInOrOut', 
+    'loggingInOrOut',
     () => Meteor.loggingIn() || Meteor.loggingOut()
   );
 }
@@ -872,6 +1166,6 @@ const attemptToMatchHash = (accounts, hash, success) => {
 
 // Export for testing
 export const AccountsTest = {
-  attemptToMatchHash: (hash, success) => 
+  attemptToMatchHash: (hash, success) =>
     attemptToMatchHash(Accounts, hash, success),
 };
